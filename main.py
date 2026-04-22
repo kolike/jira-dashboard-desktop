@@ -19,6 +19,7 @@ from PySide6.QtCore import QObject, QTimer, Qt, Signal, Slot, QSize
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -78,6 +79,7 @@ DEFAULT_CONFIG = {
     "blue_jql": 'project = "Рабочее место" AND (Регион = Владимир OR Регион = "Не заполнено" OR Регион = Нижний-Новгород OR Регион = Москва OR "Регион портал" = "Владимир(офис)" OR "Регион портал" = "Москва(офис)") AND resolution = Unresolved AND assignee in (EMPTY)',
     "work_jql": 'project = "Рабочее место" AND resolution = Unresolved AND assignee = currentUser()',
     "completed_jql": 'project = "Рабочее место" AND assignee = currentUser() AND resolution != Unresolved ORDER BY resolved DESC',
+    "unassigned_alert_minutes": 30,
 }
 
 DEFAULT_STATE = {
@@ -89,6 +91,18 @@ DEFAULT_STATE = {
     "current_work_keys": [],
     "last_check_time": "",
     "last_error": "",
+    "analytics": {
+        "taken_count": 0,
+        "new_red_count": 0,
+        "new_blue_count": 0,
+        "new_work_count": 0,
+        "completed_records": [],
+        "first_seen_by_key": {},
+        "daily_created_seen": {},
+        "daily_closed": {},
+    },
+    "duplicate_hints_shown": [],
+    "alerted_unassigned_keys": [],
 }
 
 
@@ -165,6 +179,7 @@ class AppSignals(QObject):
     blue_issues_updated = Signal(list)
     work_issues_updated = Signal(list)
     completed_issues_loaded = Signal(list)
+    analytics_updated = Signal(dict)
 
 
 class MemoryLogHandler(logging.Handler):
@@ -195,6 +210,9 @@ class JiraClient:
         self.field_name_map: dict[str, str] = {}
         self.region_field_ids: list[str] = []
         self.region_portal_field_ids: list[str] = []
+        self.request_type_field_ids: list[str] = []
+        self.request_type_name_map: dict[str, str] = {}
+        self.issue_request_type_cache: dict[str, str] = {}
 
     def _headers(self, token: str) -> dict[str, str]:
         return {
@@ -217,6 +235,7 @@ class JiraClient:
         self.field_name_map.clear()
         self.region_field_ids.clear()
         self.region_portal_field_ids.clear()
+        self.request_type_field_ids.clear()
 
         for item in data:
             if not isinstance(item, dict):
@@ -233,6 +252,43 @@ class JiraClient:
                 self.region_field_ids.append(field_id)
             elif lowered == "регион портал":
                 self.region_portal_field_ids.append(field_id)
+            elif lowered in {"тип запроса", "тип обращения", "request type"}:
+                self.request_type_field_ids.append(field_id)
+
+    def _resolve_request_type_name(self, base_url: str, token: str, request_type_id: str) -> str:
+        if not request_type_id:
+            return "Не указан"
+        if request_type_id in self.request_type_name_map:
+            return self.request_type_name_map[request_type_id]
+
+        detail_url = f"{base_url.rstrip('/')}/rest/servicedeskapi/requesttype/{request_type_id}"
+        detail_response = self.session.get(detail_url, headers=self._headers(token), timeout=20)
+        if detail_response.ok:
+            detail_payload = detail_response.json()
+            payload = detail_payload if isinstance(detail_payload, dict) else {}
+            name = str(payload.get("name") or "").strip()
+            if name:
+                self.request_type_name_map[request_type_id] = name
+                return name
+
+        return request_type_id
+    def fetch_request_types(self, base_url: str, token: str) -> None:
+        url = f"{base_url.rstrip('/')}/rest/servicedeskapi/requesttype"
+        response = self.session.get(url, headers=self._headers(token), timeout=20)
+        if not response.ok:
+            return
+        data = response.json()
+        values = data.get("values", []) if isinstance(data, dict) else []
+        if not isinstance(values, list):
+            return
+        self.request_type_name_map.clear()
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            request_type_id = str(item.get("id") or "").strip()
+            request_type_name = str(item.get("name") or "").strip()
+            if request_type_id and request_type_name:
+                self.request_type_name_map[request_type_id] = request_type_name
 
     def fetch_issues(self, base_url: str, token: str, jql: str) -> list[dict[str, Any]]:
         url = f"{base_url.rstrip('/')}/rest/api/2/search"
@@ -276,6 +332,47 @@ class JiraClient:
                 or "Неизвестно"
             )
         return "Неизвестно"
+
+    def extract_request_type(self, base_url: str, token: str, issue: dict[str, Any]) -> str:
+        issue_key = str(issue.get("key") or "").strip()
+        if not issue_key:
+            return "Не указан"
+
+        cached = self.issue_request_type_cache.get(issue_key)
+        if cached:
+            return cached
+
+        url = f"{base_url.rstrip('/')}/rest/servicedeskapi/request/{issue_key}"
+        response = self.session.get(url, headers=self._headers(token), timeout=20)
+        if response.ok:
+            response_data = response.json()
+            data = response_data if isinstance(response_data, dict) else {}
+            request_type_id = str(data.get("requestTypeId") or "").strip()
+            if request_type_id:
+                name = self._resolve_request_type_name(base_url, token, request_type_id)
+                self.issue_request_type_cache[issue_key] = name
+                return name
+
+        fields = issue.get("fields", {}) or {}
+        for field_id in self.request_type_field_ids:
+            parsed = self._parse_region_value(fields.get(field_id))
+            if parsed:
+                if parsed.isdigit():
+                    parsed = self._resolve_request_type_name(base_url, token, parsed)
+                self.issue_request_type_cache[issue_key] = parsed
+                return parsed
+
+        for key, value in fields.items():
+            readable = self.field_name_map.get(key, key).strip().lower()
+            if readable in {"тип запроса", "тип обращения", "request type"}:
+                parsed = self._parse_region_value(value)
+                if parsed:
+                    if parsed.isdigit():
+                        parsed = self._resolve_request_type_name(base_url, token, parsed)
+                    self.issue_request_type_cache[issue_key] = parsed
+                    return parsed
+
+        return "Не указан"
 
     @staticmethod
     def _parse_region_value(value: Any) -> str:
@@ -617,43 +714,96 @@ class CompletedWindow(QWidget):
         self.refresh_button.setMinimumHeight(38)
         self.refresh_button.clicked.connect(self.tray_app.load_completed_issues)
 
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Поиск: ключ, тема, автор…")
+        self.search_edit.textChanged.connect(self.apply_filters)
+
+        self.category_filter = QComboBox()
+        self.category_filter.currentIndexChanged.connect(self.apply_filters)
+        self.status_filter = QComboBox()
+        self.status_filter.currentIndexChanged.connect(self.apply_filters)
+        self.region_filter = QComboBox()
+        self.region_filter.currentIndexChanged.connect(self.apply_filters)
+        self.request_type_filter = QComboBox()
+        self.request_type_filter.currentIndexChanged.connect(self.apply_filters)
+
+        self.stats_label = QLabel("Статистика: —")
+        self.stats_label.setStyleSheet(
+            """
+            QLabel {
+                color: #B7C6EC;
+                font-size: 12px;
+                font-weight: 600;
+                background: transparent;
+                border: none;
+            }
+            """
+        )
+
         self.list_widget = BubbleGridWidget("#B58CFF", QSize(300, 118))
         self.list_widget.itemClicked.connect(self.open_issue_from_item)
+        self.all_issues: list[dict[str, Any]] = []
+        self.analytics_data: dict[str, Any] = {}
 
         top = QHBoxLayout()
         top.addWidget(self.title_label)
         top.addStretch()
         top.addWidget(self.refresh_button)
 
+        filters = QHBoxLayout()
+        filters.setSpacing(8)
+        filters.addWidget(self.search_edit, 2)
+        filters.addWidget(self.category_filter, 1)
+        filters.addWidget(self.status_filter, 1)
+        filters.addWidget(self.region_filter, 1)
+        filters.addWidget(self.request_type_filter, 1)
+
         root = QVBoxLayout()
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
         root.addLayout(top)
         root.addWidget(self.sub_label)
+        root.addLayout(filters)
+        root.addWidget(self.stats_label)
         root.addWidget(self.list_widget)
 
         self.setLayout(root)
         self.setStyleSheet(
             """
             QWidget {
-                background: #090D18;
-                color: #F3F6FF;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 #060D1D, stop:0.6 #09152B, stop:1 #0A1931);
+                color: #F7FAFF;
                 font-family: Segoe UI, Arial, sans-serif;
             }
+            QLineEdit, QComboBox {
+                background: rgba(16, 29, 52, 0.82);
+                color: #F3F7FF;
+                border: 1px solid rgba(120, 162, 230, 0.45);
+                border-radius: 10px;
+                padding: 7px 10px;
+                min-height: 34px;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid rgba(137, 207, 255, 0.95);
+            }
             QPushButton {
-                background: #171F34;
-                color: #F4F7FF;
-                border: 1px solid #4C5F92;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 rgba(57, 118, 215, 0.55),
+                    stop:1 rgba(86, 213, 197, 0.50));
+                color: #F7FBFF;
+                border: 1px solid rgba(126, 168, 244, 0.88);
                 border-radius: 12px;
                 padding: 8px 12px;
-                font-weight: 700;
+                font-weight: 800;
             }
             QPushButton:hover {
-                background: #202A45;
-                border: 1px solid #8EB5FF;
+                background: rgba(90, 160, 245, 0.65);
+                border: 1px solid #B0D6FF;
             }
             """
         )
+        self._set_default_filters()
 
     def open_issue_from_item(self, item: QListWidgetItem) -> None:
         issue_url = item.data(Qt.UserRole)
@@ -662,6 +812,117 @@ class CompletedWindow(QWidget):
 
     @Slot(list)
     def update_issues(self, issues: list[dict[str, Any]]) -> None:
+        self.all_issues = issues
+        self._rebuild_filter_values()
+        self.apply_filters()
+
+    @Slot(dict)
+    def update_analytics(self, analytics: dict[str, Any]) -> None:
+        self.analytics_data = analytics or {}
+        self.apply_filters()
+
+    def _set_default_filters(self) -> None:
+        self.category_filter.clear()
+        self.category_filter.addItems(["Все категории", "Ковров", "Регионы", "Прочее"])
+        self.status_filter.clear()
+        self.status_filter.addItem("Все статусы")
+        self.region_filter.clear()
+        self.region_filter.addItem("Все регионы")
+        self.request_type_filter.clear()
+        self.request_type_filter.addItem("Все типы запроса")
+
+    def _rebuild_filter_values(self) -> None:
+        statuses = sorted(
+            {
+                self._status_name(issue.get("fields", {}) or {})
+                for issue in self.all_issues
+            }
+        )
+        regions = sorted(
+            {
+                self.tray_app.client.extract_region(issue.get("fields", {}) or {})
+                for issue in self.all_issues
+            }
+        )
+        request_types = sorted(
+            {
+                self.tray_app.get_request_type(issue)
+                for issue in self.all_issues
+            }
+        )
+
+        current_status = self.status_filter.currentText()
+        current_region = self.region_filter.currentText()
+        current_request_type = self.request_type_filter.currentText()
+
+        self.status_filter.blockSignals(True)
+        self.region_filter.blockSignals(True)
+        self.request_type_filter.blockSignals(True)
+
+        self.status_filter.clear()
+        self.status_filter.addItem("Все статусы")
+        self.status_filter.addItems([s for s in statuses if s])
+
+        self.region_filter.clear()
+        self.region_filter.addItem("Все регионы")
+        self.region_filter.addItems([r for r in regions if r])
+
+        self.request_type_filter.clear()
+        self.request_type_filter.addItem("Все типы запроса")
+        self.request_type_filter.addItems([r for r in request_types if r and r != "Не указан"])
+
+        idx_status = self.status_filter.findText(current_status)
+        if idx_status >= 0:
+            self.status_filter.setCurrentIndex(idx_status)
+        idx_region = self.region_filter.findText(current_region)
+        if idx_region >= 0:
+            self.region_filter.setCurrentIndex(idx_region)
+        idx_request_type = self.request_type_filter.findText(current_request_type)
+        if idx_request_type >= 0:
+            self.request_type_filter.setCurrentIndex(idx_request_type)
+
+        self.status_filter.blockSignals(False)
+        self.region_filter.blockSignals(False)
+        self.request_type_filter.blockSignals(False)
+
+    def apply_filters(self) -> None:
+        query = self.search_edit.text().strip().lower()
+        selected_category = self.category_filter.currentText()
+        selected_status = self.status_filter.currentText()
+        selected_region = self.region_filter.currentText()
+        selected_request_type = self.request_type_filter.currentText()
+
+        filtered: list[dict[str, Any]] = []
+        for issue in self.all_issues:
+            fields = issue.get("fields", {}) or {}
+            issue_key = str(issue.get("key", ""))
+            summary = str(fields.get("summary") or "")
+            author = self.tray_app.client.extract_author(fields)
+            category = self.tray_app.classify_issue_category(fields)
+            status_name = self._status_name(fields)
+            region_name = self.tray_app.client.extract_region(fields)
+            request_type = self.tray_app.get_request_type(issue)
+
+            if selected_category != "Все категории" and category != selected_category:
+                continue
+            if selected_status != "Все статусы" and status_name != selected_status:
+                continue
+            if selected_region != "Все регионы" and region_name != selected_region:
+                continue
+            if selected_request_type != "Все типы запроса" and request_type != selected_request_type:
+                continue
+
+            if query:
+                haystack = f"{issue_key} {summary} {author} {status_name} {region_name} {request_type}".lower()
+                if query not in haystack:
+                    continue
+
+            filtered.append(issue)
+
+        self._render_issues(filtered)
+        self._render_stats(filtered)
+
+    def _render_issues(self, issues: list[dict[str, Any]]) -> None:
         self.list_widget.clear()
 
         if not issues:
@@ -699,6 +960,47 @@ class CompletedWindow(QWidget):
             item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             item.setData(Qt.UserRole, self.tray_app.build_issue_url(issue_key))
             self.list_widget.addItem(item)
+
+    def _render_stats(self, issues: list[dict[str, Any]]) -> None:
+        total = len(issues)
+        by_category = {"Ковров": 0, "Регионы": 0, "Прочее": 0}
+        for issue in issues:
+            category = self.tray_app.classify_issue_category(issue.get("fields", {}) or {})
+            by_category[category] = by_category.get(category, 0) + 1
+
+        analytics_total = len((self.analytics_data or {}).get("completed_records", []))
+        taken_count = int((self.analytics_data or {}).get("taken_count", 0))
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        daily_created_seen = int((self.analytics_data or {}).get("daily_created_seen", {}).get(today_key, 0))
+        daily_closed = int((self.analytics_data or {}).get("daily_closed", {}).get(today_key, 0))
+        reaction_values = [
+            int(item.get("reaction_minutes"))
+            for item in (self.analytics_data or {}).get("completed_records", [])
+            if isinstance(item, dict) and item.get("reaction_minutes") is not None
+        ]
+        avg_reaction = int(sum(reaction_values) / len(reaction_values)) if reaction_values else 0
+        request_type_counts: dict[str, int] = {}
+        for issue in issues:
+            request_type = self.tray_app.get_request_type(issue)
+            if request_type and request_type != "Не указан":
+                request_type_counts[request_type] = request_type_counts.get(request_type, 0) + 1
+
+        top_request_types = sorted(request_type_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        request_type_stats = ", ".join([f"{name}: {count}" for name, count in top_request_types]) or "нет данных"
+
+        self.stats_label.setText(
+            "Статистика: "
+            f"в фильтре {total} | "
+            f"Ковров {by_category.get('Ковров', 0)} | "
+            f"Регионы {by_category.get('Регионы', 0)} | "
+            f"Прочее {by_category.get('Прочее', 0)} | "
+            f"накоплено без дублей {analytics_total} | "
+            f"взято в работу {taken_count} | "
+            f"сегодня создано {daily_created_seen} | "
+            f"сегодня закрыто {daily_closed} | "
+            f"ср. реакция {avg_reaction} мин | "
+            f"типы запроса: {request_type_stats}"
+        )
 
     @staticmethod
     def _status_name(fields: dict[str, Any]) -> str:
@@ -929,8 +1231,9 @@ class DashboardWindow(QWidget):
         self.setStyleSheet(
             """
             QWidget {
-                background: #070A13;
-                color: #F3F6FF;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 #060B18, stop:0.55 #0B1326, stop:1 #091426);
+                color: #F4F7FF;
                 font-family: Segoe UI, Arial, sans-serif;
             }
             QLabel {
@@ -938,17 +1241,17 @@ class DashboardWindow(QWidget):
                 border: none;
             }
             QLabel#MainTitle {
-                color: #F8FBFF;
-                font-size: 24px;
+                color: #F8FCFF;
+                font-size: 25px;
                 font-weight: 900;
-                letter-spacing: 1px;
+                letter-spacing: 1.4px;
                 background: transparent;
                 border: none;
             }
             QLabel#SubTitle {
-                color: #92A4D3;
+                color: #A6B8E6;
                 font-size: 12px;
-                font-weight: 600;
+                font-weight: 700;
                 background: transparent;
                 border: none;
             }
@@ -1109,12 +1412,25 @@ class DashboardWindow(QWidget):
         self.tray_app.current_blue_issues = []
         self.tray_app.current_work_issues = []
         self.tray_app.last_error = ""
+        self.tray_app.analytics = {
+            "taken_count": 0,
+            "new_red_count": 0,
+            "new_blue_count": 0,
+            "new_work_count": 0,
+            "completed_records": [],
+            "first_seen_by_key": {},
+            "daily_created_seen": {},
+            "daily_closed": {},
+        }
+        self.tray_app.duplicate_hints_shown.clear()
+        self.tray_app.alerted_unassigned_keys.clear()
         self.tray_app.persist_state()
         self.tray_app.update_tray_tooltip()
         self.tray_app.emit_stats()
         self.tray_app.signals.red_issues_updated.emit([])
         self.tray_app.signals.blue_issues_updated.emit([])
         self.tray_app.signals.work_issues_updated.emit([])
+        self.tray_app.signals.analytics_updated.emit(self.tray_app.analytics)
         self.tray_app.logger.info("Состояние сброшено вручную")
         self.tray_app.show_qt_message(APP_TITLE, "Состояние сброшено")
 
@@ -1215,12 +1531,20 @@ class DashboardWindow(QWidget):
             widget.setItemWidget(item, card)
 
     def build_issue_card_widget(self, text_lines, accent, issue_key=None, show_button=True):
+        accent = accent or "#6EA8FF"
+        soft_bg = "rgba(12, 17, 30, 230)"
+        if accent.lower() in {"#00ffa6", "#68ffc0"}:
+            soft_bg = "rgba(14, 28, 24, 236)"
+        elif accent.lower() == "#6b7280":
+            soft_bg = "rgba(24, 26, 32, 230)"
+
         frame = QFrame()
+        frame.setObjectName("IssueCard")
         frame.setStyleSheet(f"""
-            QFrame {{
-                background: rgba(12, 15, 28, 222);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 14px;
+            QFrame#IssueCard {{
+                background: {soft_bg};
+                border: 1px solid {accent};
+                border-radius: 16px;
             }}
         """)
 
@@ -1249,16 +1573,18 @@ class DashboardWindow(QWidget):
 
             btn.setStyleSheet("""
                 QPushButton {
-                    background: rgba(80,160,255,0.15);
-                    color: #7EB7FF;
-                    border: 1px solid #4EA5FF;
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 rgba(71, 149, 255, 0.30),
+                        stop:1 rgba(104, 255, 214, 0.28));
+                    color: #E7F4FF;
+                    border: 1px solid rgba(126,183,255,0.85);
                     border-radius: 8px;
                     font-size: 11px;
-                    font-weight: 700;
+                    font-weight: 800;
                     padding: 2px 8px;
                 }
                 QPushButton:hover {
-                    background: rgba(80,160,255,0.35);
+                    background: rgba(89, 172, 255, 0.45);
                 }
             """)
 
@@ -1325,30 +1651,305 @@ class DashboardWindow(QWidget):
 
 
 class TrayApp:
-   
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return 0
+
+    def classify_issue_category(self, fields: dict[str, Any]) -> str:
+        region = self.client.extract_region(fields).lower()
+        if "ковров" in region:
+            return "Ковров"
+        if region and region != "не указан":
+            return "Регионы"
+        return "Прочее"
+
+    def get_request_type(self, issue: dict[str, Any]) -> str:
+        base_url = self.config.get("base_url", "").strip()
+        token = self.config.get("token", "").strip()
+        if not base_url or not token:
+            return "Не указан"
+        return self.client.extract_request_type(base_url, token, issue)
+
+    @staticmethod
+    def _tokenize_summary(text: str) -> set[str]:
+        stopwords = {
+            "и", "или", "для", "что", "как", "это", "при", "надо", "нужно",
+            "the", "and", "for", "with", "from", "user", "jira",
+        }
+        tokens = set()
+        for raw in text.lower().replace("/", " ").replace("-", " ").split():
+            token = "".join(ch for ch in raw if ch.isalnum())
+            if len(token) >= 4 and token not in stopwords:
+                tokens.add(token)
+        return tokens
+
+    def _find_similar_issue_key(self, issue: dict[str, Any]) -> str:
+        fields = issue.get("fields", {}) or {}
+        summary = str(fields.get("summary") or "")
+        source_tokens = self._tokenize_summary(summary)
+        if len(source_tokens) < 2:
+            return ""
+
+        candidates = self.current_red_issues + self.current_blue_issues + self.current_work_issues
+        issue_key = str(issue.get("key") or "")
+        best_key = ""
+        best_score = 0.0
+        for candidate in candidates:
+            candidate_key = str(candidate.get("key") or "")
+            if not candidate_key or candidate_key == issue_key:
+                continue
+            c_fields = candidate.get("fields", {}) or {}
+            c_summary = str(c_fields.get("summary") or "")
+            candidate_tokens = self._tokenize_summary(c_summary)
+            if not candidate_tokens:
+                continue
+            intersection = source_tokens & candidate_tokens
+            if len(intersection) < 2:
+                continue
+            score = len(intersection) / max(1, min(len(source_tokens), len(candidate_tokens)))
+            if score > best_score:
+                best_score = score
+                best_key = candidate_key
+        return best_key if best_score >= 0.6 else ""
+
+    def _track_daily_created_seen(self, issues: list[dict[str, Any]]) -> None:
+        first_seen_map = self.analytics.get("first_seen_by_key", {})
+        daily_created_seen = self.analytics.get("daily_created_seen", {})
+        now = datetime.now()
+        today_key = now.strftime("%Y-%m-%d")
+
+        for issue in issues:
+            issue_key = str(issue.get("key") or "").strip()
+            if not issue_key or issue_key in first_seen_map:
+                continue
+            first_seen_map[issue_key] = now.isoformat()
+            daily_created_seen[today_key] = self._safe_int(daily_created_seen.get(today_key, 0)) + 1
+
+        self.analytics["first_seen_by_key"] = first_seen_map
+        self.analytics["daily_created_seen"] = daily_created_seen
+
+    def _track_unassigned_alerts(self, issues: list[dict[str, Any]]) -> None:
+        threshold_minutes = self._safe_int(self.config.get("unassigned_alert_minutes", 30))
+        alerted = self.alerted_unassigned_keys
+        now = datetime.now()
+
+        for issue in issues:
+            issue_key = str(issue.get("key") or "").strip()
+            if not issue_key or issue_key in alerted:
+                continue
+            fields = issue.get("fields", {}) or {}
+            if fields.get("assignee"):
+                continue
+            region = self.client.extract_region(fields)
+            if "ковров" not in region.lower():
+                continue
+
+            created_raw = str(fields.get("created") or "").strip()
+            if not created_raw:
+                continue
+            try:
+                created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                continue
+            age_minutes = int((now - created_dt).total_seconds() // 60)
+            if age_minutes < threshold_minutes:
+                continue
+
+            self.show_qt_message(APP_TITLE, f"🔥 КОВРОВ {issue_key} без исполнителя {age_minutes} мин")
+            self.logger.warning(f"{issue_key} без исполнителя {age_minutes} мин (регион: {region})")
+            alerted.add(issue_key)
+
+    def _record_completed_analytics(self, issues: list[dict[str, Any]]) -> None:
+        existing_records = self.analytics.get("completed_records", [])
+        existing_ids = {
+            f"{item.get('key', '')}|{item.get('resolved', '')}"
+            for item in existing_records
+            if isinstance(item, dict)
+        }
+
+        added = 0
+        daily_closed = self.analytics.get("daily_closed", {})
+        first_seen_map = self.analytics.get("first_seen_by_key", {})
+        for issue in issues:
+            issue_key = str(issue.get("key") or "").strip()
+            fields = issue.get("fields", {}) or {}
+            resolved = str(fields.get("resolved") or "").strip()
+            if not issue_key or not resolved:
+                continue
+
+            record_id = f"{issue_key}|{resolved}"
+            if record_id in existing_ids:
+                continue
+
+            category = self.classify_issue_category(fields)
+            status = self.dashboard.get_status_name(fields)
+            region = self.client.extract_region(fields)
+            author = self.client.extract_author(fields)
+            request_type = self.get_request_type(issue)
+            created = str(fields.get("created") or "").strip()
+            reaction_minutes = None
+            first_seen_raw = str(first_seen_map.get(issue_key) or "").strip()
+            if created and first_seen_raw:
+                try:
+                    created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    first_seen_dt = datetime.fromisoformat(first_seen_raw)
+                    reaction_minutes = int((first_seen_dt - created_dt).total_seconds() // 60)
+                except Exception:
+                    reaction_minutes = None
+
+            try:
+                resolved_date = datetime.fromisoformat(resolved.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+                daily_closed[resolved_date] = self._safe_int(daily_closed.get(resolved_date, 0)) + 1
+            except Exception:
+                pass
+
+            existing_records.append(
+                {
+                    "key": issue_key,
+                    "resolved": resolved,
+                    "category": category,
+                    "status": status,
+                    "region": region,
+                    "author": author,
+                    "request_type": request_type,
+                    "created": created,
+                    "first_seen": first_seen_raw,
+                    "reaction_minutes": reaction_minutes,
+                }
+            )
+            existing_ids.add(record_id)
+            added += 1
+
+        if added:
+            self.analytics["completed_records"] = existing_records
+            self.analytics["daily_closed"] = daily_closed
+            self.logger.info(f"Аналитика completed обновлена, добавлено без дублей: {added}")
+            self.signals.analytics_updated.emit(self.analytics)
+
+    def _jira_assignee_payload(self) -> dict[str, str]:
+        base_url = self.config.get("base_url", "").rstrip("/")
+        token = self.config.get("token", "").strip()
+        if not base_url or not token:
+            raise ValueError("Не заполнены base_url/token")
+
+        url = f"{base_url}/rest/api/2/myself"
+        response = self.client.session.get(url, headers=self.client._headers(token), timeout=20)
+        if not response.ok:
+            raise RequestException(f"Не удалось определить текущего пользователя: HTTP {response.status_code}")
+
+        me_json = response.json()
+        me = me_json if isinstance(me_json, dict) else {}
+        account_id = str(me.get("accountId") or "").strip()
+        user_name = str(me.get("name") or "").strip()
+        user_key = str(me.get("key") or "").strip()
+
+        if account_id:
+            return {"accountId": account_id}
+        if user_name:
+            return {"name": user_name}
+        if user_key:
+            return {"name": user_key}
+        return {"name": "-1"}
+
+    @staticmethod
+    def _find_in_progress_transition_id(transitions: list[dict[str, Any]]) -> str:
+        prioritized_names = [
+            "в работу",
+            "выполняется",
+            "в процессе",
+            "in progress",
+            "start progress",
+            "начать работу",
+        ]
+
+        normalized: list[tuple[str, str]] = []
+        for item in transitions:
+            if not isinstance(item, dict):
+                continue
+            transition_id = str(item.get("id") or "").strip()
+            transition_name = str(item.get("name") or "").strip()
+            if not transition_id or not transition_name:
+                continue
+            normalized.append((transition_id, transition_name.lower()))
+
+        for preferred_name in prioritized_names:
+            for transition_id, transition_name in normalized:
+                if preferred_name in transition_name:
+                    return transition_id
+        return ""
+
+    def _move_issue_to_in_progress(self, issue_key: str) -> bool:
+        base_url = self.config.get("base_url", "").rstrip("/")
+        token = self.config.get("token", "").strip()
+        transitions_url = f"{base_url}/rest/api/2/issue/{issue_key}/transitions"
+
+        response = self.client.session.get(
+            transitions_url,
+            headers=self.client._headers(token),
+            timeout=20,
+        )
+        if not response.ok:
+            raise RequestException(f"Не удалось получить переходы: HTTP {response.status_code}")
+
+        response_data = response.json()
+        data = response_data if isinstance(response_data, dict) else {}
+        transitions = data.get("transitions", [])
+        if not isinstance(transitions, list):
+            transitions = []
+
+        transition_id = self._find_in_progress_transition_id(transitions)
+        if not transition_id:
+            self.logger.warning(f"Для {issue_key} не найден переход в 'В работе'")
+            return False
+
+        payload = {"transition": {"id": transition_id}}
+        transition_response = self.client.session.post(
+            transitions_url,
+            json=payload,
+            headers=self.client._headers(token),
+            timeout=20,
+        )
+        if transition_response.status_code not in (200, 204):
+            raise RequestException(
+                f"Не удалось перевести задачу в работу: HTTP {transition_response.status_code}: {transition_response.text}"
+            )
+        return True
+
     def take_issue(self, issue_key: str):
         try:
-            url = f"{self.config['base_url']}/rest/api/2/issue/{issue_key}/assignee"
+            base_url = self.config.get("base_url", "").rstrip("/")
+            token = self.config.get("token", "").strip()
+            if not base_url or not token:
+                raise ValueError("Заполни URL и токен в настройках")
 
-            payload = {
-                "name": "-1"   # назначить на себя
-            }
+            url = f"{base_url}/rest/api/2/issue/{issue_key}/assignee"
+            payload = self._jira_assignee_payload()
 
-            headers = {
-                "Authorization": f"Bearer {self.config['token']}",
-                "Content-Type": "application/json"
-            }
-
-            response = requests.put(url, json=payload, headers=headers)
+            response = self.client.session.put(
+                url,
+                json=payload,
+                headers=self.client._headers(token),
+                timeout=20,
+            )
 
             if response.status_code in (200, 204):
-                self.logger.info(f"{issue_key} взята в работу")
-                self.show_qt_message("Jira", f"{issue_key} взята в работу")
+                moved_to_work = self._move_issue_to_in_progress(issue_key)
+                if moved_to_work:
+                    self.logger.info(f"{issue_key} назначена и переведена в работу")
+                    self.show_qt_message("Jira", f"{issue_key} назначена и переведена в работу")
+                else:
+                    self.logger.info(f"{issue_key} назначена, но переход в работу не найден")
+                    self.show_qt_message("Jira", f"{issue_key} назначена (переход в работу не найден)")
+                self.analytics["taken_count"] = self._safe_int(self.analytics.get("taken_count", 0)) + 1
+                self.signals.analytics_updated.emit(self.analytics)
 
                 # обновляем список
                 self.run_check(force_notify=True)
             else:
-                raise Exception(response.text)
+                raise Exception(f"HTTP {response.status_code}: {response.text}")
 
         except Exception as e:
             self.logger.error(f"Ошибка взятия {issue_key}: {e}")
@@ -1375,6 +1976,19 @@ class TrayApp:
 
         self.last_check_time: str = self.state.get("last_check_time", "")
         self.last_error: str = self.state.get("last_error", "")
+        analytics_state = self.state.get("analytics", {}) if isinstance(self.state.get("analytics"), dict) else {}
+        self.analytics: dict[str, Any] = {
+            "taken_count": int(analytics_state.get("taken_count", 0)),
+            "new_red_count": int(analytics_state.get("new_red_count", 0)),
+            "new_blue_count": int(analytics_state.get("new_blue_count", 0)),
+            "new_work_count": int(analytics_state.get("new_work_count", 0)),
+            "completed_records": list(analytics_state.get("completed_records", [])),
+            "first_seen_by_key": dict(analytics_state.get("first_seen_by_key", {})),
+            "daily_created_seen": dict(analytics_state.get("daily_created_seen", {})),
+            "daily_closed": dict(analytics_state.get("daily_closed", {})),
+        }
+        self.duplicate_hints_shown: set[str] = set(self.state.get("duplicate_hints_shown", []))
+        self.alerted_unassigned_keys: set[str] = set(self.state.get("alerted_unassigned_keys", []))
 
         self._check_in_progress = False
         self._field_map_loaded = False
@@ -1415,6 +2029,7 @@ class TrayApp:
         self.signals.blue_issues_updated.emit(self.current_blue_issues)
         self.signals.work_issues_updated.emit(self.current_work_issues)
         self.signals.monitoring_changed.emit(bool(self.config.get("enabled", True)))
+        self.signals.analytics_updated.emit(self.analytics)
 
         self.show_dashboard()
         self.show_qt_message(APP_TITLE, "Приложение запущено")
@@ -1446,6 +2061,7 @@ class TrayApp:
         self.signals.blue_issues_updated.connect(self.dashboard.update_blue_issues)
         self.signals.work_issues_updated.connect(self.dashboard.update_work_issues)
         self.signals.completed_issues_loaded.connect(self.completed_window.update_issues)
+        self.signals.analytics_updated.connect(self.completed_window.update_analytics)
 
     def show_main_window(self):
         self.window.show()
@@ -1504,6 +2120,9 @@ class TrayApp:
             "current_work_keys": sorted(self.current_work_keys),
             "last_check_time": self.last_check_time,
             "last_error": self.last_error,
+            "analytics": self.analytics,
+            "duplicate_hints_shown": sorted(self.duplicate_hints_shown),
+            "alerted_unassigned_keys": sorted(self.alerted_unassigned_keys),
         }
         save_state(state)
 
@@ -1530,6 +2149,7 @@ class TrayApp:
             return
 
         self.client.fetch_fields(base_url, token)
+        self.client.fetch_request_types(base_url, token)
         self._field_map_loaded = True
         self.logger.info("Карта полей Jira загружена")
 
@@ -1594,8 +2214,10 @@ class TrayApp:
 
         def worker() -> None:
             try:
+                self.client.fetch_request_types(base_url, token)
                 issues = self.client.fetch_issues(base_url, token, completed_jql)
                 issues = self.sort_completed_issues(issues)
+                self._record_completed_analytics(issues)
                 self.signals.completed_issues_loaded.emit(issues)
                 self.logger.info(f"Загружено выполненных задач: {len(issues)}")
             except RequestException as e:
@@ -1614,6 +2236,17 @@ class TrayApp:
     def show_qt_message(self, title: str, text: str) -> None:
         self.signals.qt_message.emit(title, text)
 
+    def handle_toast_action(self, argument: str) -> None:
+        value = str(argument or "").strip()
+        if not value:
+            return
+        if value.startswith("take:"):
+            issue_key = value.split(":", 1)[1].strip()
+            if issue_key:
+                self.take_issue(issue_key)
+            return
+        webbrowser.open(value)
+
     @Slot(str, str)
     def _show_qt_message_slot(self, title: str, text: str) -> None:
         self.tray_icon.showMessage(title, text, QSystemTrayIcon.Information, 4000)
@@ -1623,8 +2256,13 @@ class TrayApp:
         fields = issue.get("fields", {}) or {}
         summary = trim_text(fields.get("summary") or "Новая заявка", 140)
         issue_url = self.build_issue_url(issue_key)
+        region = self.client.extract_region(fields)
+        is_kovrov = "ковров" in region.lower()
 
-        title = f"{'🔴⚡' if is_red else '🔵'} {issue_key}"
+        if is_kovrov:
+            title = f"🔥 {issue_key}"
+        else:
+            title = f"{'🔴⚡' if is_red else '🔵'} {issue_key}"
 
         try:
             win_toast(
@@ -1642,7 +2280,7 @@ class TrayApp:
                         "arguments": f"take:{issue_key}"
                     }
                 ],
-                on_click=issue_url,
+                on_click=self.handle_toast_action,
             )
 
         except Exception as e:
@@ -1713,6 +2351,13 @@ class TrayApp:
 
                 new_red = [issue for issue in red_issues if issue.get("key") not in self.known_red]
                 new_blue = [issue for issue in blue_issues if issue.get("key") not in self.known_blue]
+                new_work = [issue for issue in work_issues if issue.get("key") not in self.known_work]
+                self._track_daily_created_seen(new_red + new_blue + new_work)
+                self._track_unassigned_alerts(red_issues)
+
+                self.analytics["new_red_count"] = self._safe_int(self.analytics.get("new_red_count", 0)) + len(new_red)
+                self.analytics["new_blue_count"] = self._safe_int(self.analytics.get("new_blue_count", 0)) + len(new_blue)
+                self.analytics["new_work_count"] = self._safe_int(self.analytics.get("new_work_count", 0)) + len(new_work)
 
                 self.current_red_keys = red_keys_now
                 self.current_blue_keys = blue_keys_now
@@ -1745,6 +2390,16 @@ class TrayApp:
                 self.known_blue |= blue_keys_now
                 self.known_work |= work_keys_now
 
+                for issue in new_red + new_blue:
+                    issue_key = str(issue.get("key") or "").strip()
+                    if not issue_key or issue_key in self.duplicate_hints_shown:
+                        continue
+                    similar_key = self._find_similar_issue_key(issue)
+                    if similar_key:
+                        self.logger.info(f"{issue_key}: уже есть похожая проблема {similar_key}")
+                        self.show_qt_message(APP_TITLE, f"{issue_key}: уже есть похожая проблема {similar_key}")
+                        self.duplicate_hints_shown.add(issue_key)
+
                 self.logger.info(
                     f"Найдено RED: {len(red_issues)}, BLUE: {len(blue_issues)}, WORK: {len(work_issues)}"
                 )
@@ -1765,6 +2420,7 @@ class TrayApp:
                 self.signals.red_issues_updated.emit(self.current_red_issues)
                 self.signals.blue_issues_updated.emit(self.current_blue_issues)
                 self.signals.work_issues_updated.emit(self.current_work_issues)
+                self.signals.analytics_updated.emit(self.analytics)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1781,10 +2437,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-def handle_toast_action(self, argument: str):
-    if argument.startswith("take:"):
-        issue_key = argument.split(":")[1]
-        self.take_issue(issue_key)
-    else:
-        webbrowser.open(argument)
