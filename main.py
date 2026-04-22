@@ -234,6 +234,7 @@ class JiraClient:
         self.field_name_map.clear()
         self.region_field_ids.clear()
         self.region_portal_field_ids.clear()
+        self.request_type_field_ids.clear()
 
         for item in data:
             if not isinstance(item, dict):
