@@ -1350,7 +1350,7 @@ class DashboardWindow(QWidget):
 
         self.red_list = BubbleGridWidget("#FF4C7A", QSize(255, 92))
         self.blue_list = BubbleGridWidget("#4EA5FF", QSize(255, 92))
-        self.work_list = BubbleGridWidget("#68FFC0", QSize(270, 132))
+        self.work_list = BubbleGridWidget("#68FFC0", QSize(285, 140))
 
         self.red_list.itemClicked.connect(self.open_issue_from_item)
         self.blue_list.itemClicked.connect(self.open_issue_from_item)
@@ -1502,7 +1502,7 @@ class DashboardWindow(QWidget):
         for issue in issues:
             fields = issue.get("fields", {}) or {}
             issue_key = issue.get("key", "UNKNOWN")
-            summary = trim_text(fields.get("summary") or "Без темы", 54)
+            summary = trim_text(fields.get("summary") or "Без темы", 44)
             status_name = self.get_status_name(fields)
             region_name = self.tray_app.client.extract_region(fields)
             author_name = self.tray_app.client.extract_author(fields)
@@ -1524,7 +1524,7 @@ class DashboardWindow(QWidget):
             item = QListWidgetItem()
             item.setData(Qt.UserRole, self.tray_app.build_issue_url(issue_key))
             item.setToolTip(tooltip)
-            item.setSizeHint(QSize(245, 104))
+            item.setSizeHint(QSize(260, 124))
             widget.addItem(item)
 
             card = self.build_issue_card_widget(lines, accent, issue_key, show_button=False)
@@ -2265,12 +2265,10 @@ class TrayApp:
             title = f"{'🔴⚡' if is_red else '🔵'} {issue_key}"
 
         try:
-            win_toast(
-                title,
-                summary,
-                app_id="JiraFastWatcher4",
-                duration="long",
-                actions=[
+            payload = {
+                "app_id": "JiraFastWatcher4",
+                "duration": "long",
+                "actions": [
                     {
                         "content": "Открыть",
                         "arguments": issue_url
@@ -2280,8 +2278,19 @@ class TrayApp:
                         "arguments": f"take:{issue_key}"
                     }
                 ],
-                on_click=self.handle_toast_action,
-            )
+                "on_click": self.handle_toast_action,
+                "on_action": self.handle_toast_action,
+            }
+            try:
+                win_toast(title, summary, **payload)
+            except TypeError:
+                # fallback для версий win11toast, где используется параметр buttons
+                payload.pop("actions", None)
+                payload["buttons"] = [
+                    ("Открыть", issue_url),
+                    ("Взять в работу", f"take:{issue_key}"),
+                ]
+                win_toast(title, summary, **payload)
 
         except Exception as e:
             self.logger.error(f"Toast error: {e}")
