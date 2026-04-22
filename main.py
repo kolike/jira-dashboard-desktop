@@ -210,6 +210,7 @@ class JiraClient:
         self.field_name_map: dict[str, str] = {}
         self.region_field_ids: list[str] = []
         self.region_portal_field_ids: list[str] = []
+        self.request_type_field_ids: list[str] = []
         self.request_type_name_map: dict[str, str] = {}
         self.issue_request_type_cache: dict[str, str] = {}
 
@@ -251,6 +252,26 @@ class JiraClient:
                 self.region_field_ids.append(field_id)
             elif lowered == "регион портал":
                 self.region_portal_field_ids.append(field_id)
+            elif lowered in {"тип запроса", "тип обращения", "request type"}:
+                self.request_type_field_ids.append(field_id)
+
+    def _resolve_request_type_name(self, base_url: str, token: str, request_type_id: str) -> str:
+        if not request_type_id:
+            return "Не указан"
+        if request_type_id in self.request_type_name_map:
+            return self.request_type_name_map[request_type_id]
+
+        detail_url = f"{base_url.rstrip('/')}/rest/servicedeskapi/requesttype/{request_type_id}"
+        detail_response = self.session.get(detail_url, headers=self._headers(token), timeout=20)
+        if detail_response.ok:
+            detail_payload = detail_response.json()
+            payload = detail_payload if isinstance(detail_payload, dict) else {}
+            name = str(payload.get("name") or "").strip()
+            if name:
+                self.request_type_name_map[request_type_id] = name
+                return name
+
+        return request_type_id
     def fetch_request_types(self, base_url: str, token: str) -> None:
         url = f"{base_url.rstrip('/')}/rest/servicedeskapi/requesttype"
         response = self.session.get(url, headers=self._headers(token), timeout=20)
@@ -328,16 +349,26 @@ class JiraClient:
             data = response_data if isinstance(response_data, dict) else {}
             request_type_id = str(data.get("requestTypeId") or "").strip()
             if request_type_id:
-                name = self.request_type_name_map.get(request_type_id, request_type_id)
+                name = self._resolve_request_type_name(base_url, token, request_type_id)
                 self.issue_request_type_cache[issue_key] = name
                 return name
 
         fields = issue.get("fields", {}) or {}
+        for field_id in self.request_type_field_ids:
+            parsed = self._parse_region_value(fields.get(field_id))
+            if parsed:
+                if parsed.isdigit():
+                    parsed = self._resolve_request_type_name(base_url, token, parsed)
+                self.issue_request_type_cache[issue_key] = parsed
+                return parsed
+
         for key, value in fields.items():
             readable = self.field_name_map.get(key, key).strip().lower()
             if readable in {"тип запроса", "тип обращения", "request type"}:
                 parsed = self._parse_region_value(value)
                 if parsed:
+                    if parsed.isdigit():
+                        parsed = self._resolve_request_type_name(base_url, token, parsed)
                     self.issue_request_type_cache[issue_key] = parsed
                     return parsed
 
@@ -740,21 +771,35 @@ class CompletedWindow(QWidget):
         self.setStyleSheet(
             """
             QWidget {
-                background: #090D18;
-                color: #F3F6FF;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 #060D1D, stop:0.6 #09152B, stop:1 #0A1931);
+                color: #F7FAFF;
                 font-family: Segoe UI, Arial, sans-serif;
             }
+            QLineEdit, QComboBox {
+                background: rgba(16, 29, 52, 0.82);
+                color: #F3F7FF;
+                border: 1px solid rgba(120, 162, 230, 0.45);
+                border-radius: 10px;
+                padding: 7px 10px;
+                min-height: 34px;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid rgba(137, 207, 255, 0.95);
+            }
             QPushButton {
-                background: #171F34;
-                color: #F4F7FF;
-                border: 1px solid #4C5F92;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 rgba(57, 118, 215, 0.55),
+                    stop:1 rgba(86, 213, 197, 0.50));
+                color: #F7FBFF;
+                border: 1px solid rgba(126, 168, 244, 0.88);
                 border-radius: 12px;
                 padding: 8px 12px;
-                font-weight: 700;
+                font-weight: 800;
             }
             QPushButton:hover {
-                background: #202A45;
-                border: 1px solid #8EB5FF;
+                background: rgba(90, 160, 245, 0.65);
+                border: 1px solid #B0D6FF;
             }
             """
         )
@@ -1186,8 +1231,9 @@ class DashboardWindow(QWidget):
         self.setStyleSheet(
             """
             QWidget {
-                background: #070A13;
-                color: #F3F6FF;
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
+                    stop:0 #060B18, stop:0.55 #0B1326, stop:1 #091426);
+                color: #F4F7FF;
                 font-family: Segoe UI, Arial, sans-serif;
             }
             QLabel {
@@ -1195,17 +1241,17 @@ class DashboardWindow(QWidget):
                 border: none;
             }
             QLabel#MainTitle {
-                color: #F8FBFF;
-                font-size: 24px;
+                color: #F8FCFF;
+                font-size: 25px;
                 font-weight: 900;
-                letter-spacing: 1px;
+                letter-spacing: 1.4px;
                 background: transparent;
                 border: none;
             }
             QLabel#SubTitle {
-                color: #92A4D3;
+                color: #A6B8E6;
                 font-size: 12px;
-                font-weight: 600;
+                font-weight: 700;
                 background: transparent;
                 border: none;
             }
@@ -1485,12 +1531,19 @@ class DashboardWindow(QWidget):
             widget.setItemWidget(item, card)
 
     def build_issue_card_widget(self, text_lines, accent, issue_key=None, show_button=True):
+        accent = accent or "#6EA8FF"
+        soft_bg = "rgba(12, 17, 30, 230)"
+        if accent.lower() in {"#00ffa6", "#68ffc0"}:
+            soft_bg = "rgba(14, 28, 24, 236)"
+        elif accent.lower() == "#6b7280":
+            soft_bg = "rgba(24, 26, 32, 230)"
+
         frame = QFrame()
         frame.setStyleSheet(f"""
             QFrame {{
-                background: rgba(12, 15, 28, 222);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 14px;
+                background: {soft_bg};
+                border: 1px solid {accent};
+                border-radius: 16px;
             }}
         """)
 
@@ -1519,16 +1572,18 @@ class DashboardWindow(QWidget):
 
             btn.setStyleSheet("""
                 QPushButton {
-                    background: rgba(80,160,255,0.15);
-                    color: #7EB7FF;
-                    border: 1px solid #4EA5FF;
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 rgba(71, 149, 255, 0.30),
+                        stop:1 rgba(104, 255, 214, 0.28));
+                    color: #E7F4FF;
+                    border: 1px solid rgba(126,183,255,0.85);
                     border-radius: 8px;
                     font-size: 11px;
-                    font-weight: 700;
+                    font-weight: 800;
                     padding: 2px 8px;
                 }
                 QPushButton:hover {
-                    background: rgba(80,160,255,0.35);
+                    background: rgba(89, 172, 255, 0.45);
                 }
             """)
 
@@ -1687,6 +1742,9 @@ class TrayApp:
             fields = issue.get("fields", {}) or {}
             if fields.get("assignee"):
                 continue
+            region = self.client.extract_region(fields)
+            if "ковров" not in region.lower():
+                continue
 
             created_raw = str(fields.get("created") or "").strip()
             if not created_raw:
@@ -1699,9 +1757,7 @@ class TrayApp:
             if age_minutes < threshold_minutes:
                 continue
 
-            region = self.client.extract_region(fields)
-            priority_prefix = "🔥 КОВРОВ " if "ковров" in region.lower() else "⚠️ "
-            self.show_qt_message(APP_TITLE, f"{priority_prefix}{issue_key} без исполнителя {age_minutes} мин")
+            self.show_qt_message(APP_TITLE, f"🔥 КОВРОВ {issue_key} без исполнителя {age_minutes} мин")
             self.logger.warning(f"{issue_key} без исполнителя {age_minutes} мин (регион: {region})")
             alerted.add(issue_key)
 
@@ -2179,6 +2235,17 @@ class TrayApp:
     def show_qt_message(self, title: str, text: str) -> None:
         self.signals.qt_message.emit(title, text)
 
+    def handle_toast_action(self, argument: str) -> None:
+        value = str(argument or "").strip()
+        if not value:
+            return
+        if value.startswith("take:"):
+            issue_key = value.split(":", 1)[1].strip()
+            if issue_key:
+                self.take_issue(issue_key)
+            return
+        webbrowser.open(value)
+
     @Slot(str, str)
     def _show_qt_message_slot(self, title: str, text: str) -> None:
         self.tray_icon.showMessage(title, text, QSystemTrayIcon.Information, 4000)
@@ -2212,7 +2279,7 @@ class TrayApp:
                         "arguments": f"take:{issue_key}"
                     }
                 ],
-                on_click=issue_url,
+                on_click=self.handle_toast_action,
             )
 
         except Exception as e:
@@ -2285,7 +2352,7 @@ class TrayApp:
                 new_blue = [issue for issue in blue_issues if issue.get("key") not in self.known_blue]
                 new_work = [issue for issue in work_issues if issue.get("key") not in self.known_work]
                 self._track_daily_created_seen(new_red + new_blue + new_work)
-                self._track_unassigned_alerts(red_issues + blue_issues)
+                self._track_unassigned_alerts(red_issues)
 
                 self.analytics["new_red_count"] = self._safe_int(self.analytics.get("new_red_count", 0)) + len(new_red)
                 self.analytics["new_blue_count"] = self._safe_int(self.analytics.get("new_blue_count", 0)) + len(new_blue)
