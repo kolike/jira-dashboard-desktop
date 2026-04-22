@@ -1539,8 +1539,9 @@ class DashboardWindow(QWidget):
             soft_bg = "rgba(24, 26, 32, 230)"
 
         frame = QFrame()
+        frame.setObjectName("IssueCard")
         frame.setStyleSheet(f"""
-            QFrame {{
+            QFrame#IssueCard {{
                 background: {soft_bg};
                 border: 1px solid {accent};
                 border-radius: 16px;
