@@ -204,6 +204,7 @@ class JiraClient:
         self.field_name_map: dict[str, str] = {}
         self.region_field_ids: list[str] = []
         self.region_portal_field_ids: list[str] = []
+        self.request_type_field_ids: list[str] = []
 
     def _headers(self, token: str) -> dict[str, str]:
         return {
@@ -226,6 +227,7 @@ class JiraClient:
         self.field_name_map.clear()
         self.region_field_ids.clear()
         self.region_portal_field_ids.clear()
+        self.request_type_field_ids.clear()
 
         for item in data:
             if not isinstance(item, dict):
@@ -242,6 +244,8 @@ class JiraClient:
                 self.region_field_ids.append(field_id)
             elif lowered == "регион портал":
                 self.region_portal_field_ids.append(field_id)
+            elif lowered in {"тип запроса", "тип обращения", "request type"}:
+                self.request_type_field_ids.append(field_id)
 
     def fetch_issues(self, base_url: str, token: str, jql: str) -> list[dict[str, Any]]:
         url = f"{base_url.rstrip('/')}/rest/api/2/search"
@@ -285,6 +289,21 @@ class JiraClient:
                 or "Неизвестно"
             )
         return "Неизвестно"
+
+    def extract_request_type(self, fields: dict[str, Any]) -> str:
+        for field_id in self.request_type_field_ids:
+            parsed = self._parse_region_value(fields.get(field_id))
+            if parsed:
+                return parsed
+
+        for key, value in fields.items():
+            readable = self.field_name_map.get(key, key).strip().lower()
+            if readable in {"тип запроса", "тип обращения", "request type"}:
+                parsed = self._parse_region_value(value)
+                if parsed:
+                    return parsed
+
+        return "Не указан"
 
     @staticmethod
     def _parse_region_value(value: Any) -> str:
@@ -636,6 +655,8 @@ class CompletedWindow(QWidget):
         self.status_filter.currentIndexChanged.connect(self.apply_filters)
         self.region_filter = QComboBox()
         self.region_filter.currentIndexChanged.connect(self.apply_filters)
+        self.request_type_filter = QComboBox()
+        self.request_type_filter.currentIndexChanged.connect(self.apply_filters)
 
         self.stats_label = QLabel("Статистика: —")
         self.stats_label.setStyleSheet(
@@ -666,6 +687,7 @@ class CompletedWindow(QWidget):
         filters.addWidget(self.category_filter, 1)
         filters.addWidget(self.status_filter, 1)
         filters.addWidget(self.region_filter, 1)
+        filters.addWidget(self.request_type_filter, 1)
 
         root = QVBoxLayout()
         root.setContentsMargins(16, 16, 16, 16)
@@ -723,6 +745,8 @@ class CompletedWindow(QWidget):
         self.status_filter.addItem("Все статусы")
         self.region_filter.clear()
         self.region_filter.addItem("Все регионы")
+        self.request_type_filter.clear()
+        self.request_type_filter.addItem("Все типы запроса")
 
     def _rebuild_filter_values(self) -> None:
         statuses = sorted(
@@ -737,12 +761,20 @@ class CompletedWindow(QWidget):
                 for issue in self.all_issues
             }
         )
+        request_types = sorted(
+            {
+                self.tray_app.client.extract_request_type(issue.get("fields", {}) or {})
+                for issue in self.all_issues
+            }
+        )
 
         current_status = self.status_filter.currentText()
         current_region = self.region_filter.currentText()
+        current_request_type = self.request_type_filter.currentText()
 
         self.status_filter.blockSignals(True)
         self.region_filter.blockSignals(True)
+        self.request_type_filter.blockSignals(True)
 
         self.status_filter.clear()
         self.status_filter.addItem("Все статусы")
@@ -752,21 +784,30 @@ class CompletedWindow(QWidget):
         self.region_filter.addItem("Все регионы")
         self.region_filter.addItems([r for r in regions if r])
 
+        self.request_type_filter.clear()
+        self.request_type_filter.addItem("Все типы запроса")
+        self.request_type_filter.addItems([r for r in request_types if r and r != "Не указан"])
+
         idx_status = self.status_filter.findText(current_status)
         if idx_status >= 0:
             self.status_filter.setCurrentIndex(idx_status)
         idx_region = self.region_filter.findText(current_region)
         if idx_region >= 0:
             self.region_filter.setCurrentIndex(idx_region)
+        idx_request_type = self.request_type_filter.findText(current_request_type)
+        if idx_request_type >= 0:
+            self.request_type_filter.setCurrentIndex(idx_request_type)
 
         self.status_filter.blockSignals(False)
         self.region_filter.blockSignals(False)
+        self.request_type_filter.blockSignals(False)
 
     def apply_filters(self) -> None:
         query = self.search_edit.text().strip().lower()
         selected_category = self.category_filter.currentText()
         selected_status = self.status_filter.currentText()
         selected_region = self.region_filter.currentText()
+        selected_request_type = self.request_type_filter.currentText()
 
         filtered: list[dict[str, Any]] = []
         for issue in self.all_issues:
@@ -777,6 +818,7 @@ class CompletedWindow(QWidget):
             category = self.tray_app.classify_issue_category(fields)
             status_name = self._status_name(fields)
             region_name = self.tray_app.client.extract_region(fields)
+            request_type = self.tray_app.client.extract_request_type(fields)
 
             if selected_category != "Все категории" and category != selected_category:
                 continue
@@ -784,9 +826,11 @@ class CompletedWindow(QWidget):
                 continue
             if selected_region != "Все регионы" and region_name != selected_region:
                 continue
+            if selected_request_type != "Все типы запроса" and request_type != selected_request_type:
+                continue
 
             if query:
-                haystack = f"{issue_key} {summary} {author} {status_name} {region_name}".lower()
+                haystack = f"{issue_key} {summary} {author} {status_name} {region_name} {request_type}".lower()
                 if query not in haystack:
                     continue
 
@@ -843,6 +887,14 @@ class CompletedWindow(QWidget):
 
         analytics_total = len((self.analytics_data or {}).get("completed_records", []))
         taken_count = int((self.analytics_data or {}).get("taken_count", 0))
+        request_type_counts: dict[str, int] = {}
+        for issue in issues:
+            request_type = self.tray_app.client.extract_request_type(issue.get("fields", {}) or {})
+            if request_type and request_type != "Не указан":
+                request_type_counts[request_type] = request_type_counts.get(request_type, 0) + 1
+
+        top_request_types = sorted(request_type_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        request_type_stats = ", ".join([f"{name}: {count}" for name, count in top_request_types]) or "нет данных"
 
         self.stats_label.setText(
             "Статистика: "
@@ -851,7 +903,8 @@ class CompletedWindow(QWidget):
             f"Регионы {by_category.get('Регионы', 0)} | "
             f"Прочее {by_category.get('Прочее', 0)} | "
             f"накоплено без дублей {analytics_total} | "
-            f"взято в работу {taken_count}"
+            f"взято в работу {taken_count} | "
+            f"типы запроса: {request_type_stats}"
         )
 
     @staticmethod
@@ -1526,6 +1579,7 @@ class TrayApp:
             status = self.dashboard.get_status_name(fields)
             region = self.client.extract_region(fields)
             author = self.client.extract_author(fields)
+            request_type = self.client.extract_request_type(fields)
 
             existing_records.append(
                 {
@@ -1535,6 +1589,7 @@ class TrayApp:
                     "status": status,
                     "region": region,
                     "author": author,
+                    "request_type": request_type,
                 }
             )
             existing_ids.add(record_id)
@@ -1570,6 +1625,70 @@ class TrayApp:
             return {"name": user_key}
         return {"name": "-1"}
 
+    @staticmethod
+    def _find_in_progress_transition_id(transitions: list[dict[str, Any]]) -> str:
+        prioritized_names = [
+            "в работу",
+            "выполняется",
+            "в процессе",
+            "in progress",
+            "start progress",
+            "начать работу",
+        ]
+
+        normalized: list[tuple[str, str]] = []
+        for item in transitions:
+            if not isinstance(item, dict):
+                continue
+            transition_id = str(item.get("id") or "").strip()
+            transition_name = str(item.get("name") or "").strip()
+            if not transition_id or not transition_name:
+                continue
+            normalized.append((transition_id, transition_name.lower()))
+
+        for preferred_name in prioritized_names:
+            for transition_id, transition_name in normalized:
+                if preferred_name in transition_name:
+                    return transition_id
+        return ""
+
+    def _move_issue_to_in_progress(self, issue_key: str) -> bool:
+        base_url = self.config.get("base_url", "").rstrip("/")
+        token = self.config.get("token", "").strip()
+        transitions_url = f"{base_url}/rest/api/2/issue/{issue_key}/transitions"
+
+        response = self.client.session.get(
+            transitions_url,
+            headers=self.client._headers(token),
+            timeout=20,
+        )
+        if not response.ok:
+            raise RequestException(f"Не удалось получить переходы: HTTP {response.status_code}")
+
+        response_data = response.json()
+        data = response_data if isinstance(response_data, dict) else {}
+        transitions = data.get("transitions", [])
+        if not isinstance(transitions, list):
+            transitions = []
+
+        transition_id = self._find_in_progress_transition_id(transitions)
+        if not transition_id:
+            self.logger.warning(f"Для {issue_key} не найден переход в 'В работе'")
+            return False
+
+        payload = {"transition": {"id": transition_id}}
+        transition_response = self.client.session.post(
+            transitions_url,
+            json=payload,
+            headers=self.client._headers(token),
+            timeout=20,
+        )
+        if transition_response.status_code not in (200, 204):
+            raise RequestException(
+                f"Не удалось перевести задачу в работу: HTTP {transition_response.status_code}: {transition_response.text}"
+            )
+        return True
+
     def take_issue(self, issue_key: str):
         try:
             base_url = self.config.get("base_url", "").rstrip("/")
@@ -1588,8 +1707,13 @@ class TrayApp:
             )
 
             if response.status_code in (200, 204):
-                self.logger.info(f"{issue_key} взята в работу")
-                self.show_qt_message("Jira", f"{issue_key} взята в работу")
+                moved_to_work = self._move_issue_to_in_progress(issue_key)
+                if moved_to_work:
+                    self.logger.info(f"{issue_key} назначена и переведена в работу")
+                    self.show_qt_message("Jira", f"{issue_key} назначена и переведена в работу")
+                else:
+                    self.logger.info(f"{issue_key} назначена, но переход в работу не найден")
+                    self.show_qt_message("Jira", f"{issue_key} назначена (переход в работу не найден)")
                 self.analytics["taken_count"] = self._safe_int(self.analytics.get("taken_count", 0)) + 1
                 self.signals.analytics_updated.emit(self.analytics)
 
