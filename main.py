@@ -79,6 +79,7 @@ DEFAULT_CONFIG = {
     "blue_jql": 'project = "Рабочее место" AND (Регион = Владимир OR Регион = "Не заполнено" OR Регион = Нижний-Новгород OR Регион = Москва OR "Регион портал" = "Владимир(офис)" OR "Регион портал" = "Москва(офис)") AND resolution = Unresolved AND assignee in (EMPTY)',
     "work_jql": 'project = "Рабочее место" AND resolution = Unresolved AND assignee = currentUser()',
     "completed_jql": 'project = "Рабочее место" AND assignee = currentUser() AND resolution != Unresolved ORDER BY resolved DESC',
+    "unassigned_alert_minutes": 30,
 }
 
 DEFAULT_STATE = {
@@ -96,7 +97,12 @@ DEFAULT_STATE = {
         "new_blue_count": 0,
         "new_work_count": 0,
         "completed_records": [],
+        "first_seen_by_key": {},
+        "daily_created_seen": {},
+        "daily_closed": {},
     },
+    "duplicate_hints_shown": [],
+    "alerted_unassigned_keys": [],
 }
 
 
@@ -204,7 +210,8 @@ class JiraClient:
         self.field_name_map: dict[str, str] = {}
         self.region_field_ids: list[str] = []
         self.region_portal_field_ids: list[str] = []
-        self.request_type_field_ids: list[str] = []
+        self.request_type_name_map: dict[str, str] = {}
+        self.issue_request_type_cache: dict[str, str] = {}
 
     def _headers(self, token: str) -> dict[str, str]:
         return {
@@ -244,8 +251,23 @@ class JiraClient:
                 self.region_field_ids.append(field_id)
             elif lowered == "регион портал":
                 self.region_portal_field_ids.append(field_id)
-            elif lowered in {"тип запроса", "тип обращения", "request type"}:
-                self.request_type_field_ids.append(field_id)
+    def fetch_request_types(self, base_url: str, token: str) -> None:
+        url = f"{base_url.rstrip('/')}/rest/servicedeskapi/requesttype"
+        response = self.session.get(url, headers=self._headers(token), timeout=20)
+        if not response.ok:
+            return
+        data = response.json()
+        values = data.get("values", []) if isinstance(data, dict) else []
+        if not isinstance(values, list):
+            return
+        self.request_type_name_map.clear()
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            request_type_id = str(item.get("id") or "").strip()
+            request_type_name = str(item.get("name") or "").strip()
+            if request_type_id and request_type_name:
+                self.request_type_name_map[request_type_id] = request_type_name
 
     def fetch_issues(self, base_url: str, token: str, jql: str) -> list[dict[str, Any]]:
         url = f"{base_url.rstrip('/')}/rest/api/2/search"
@@ -290,17 +312,33 @@ class JiraClient:
             )
         return "Неизвестно"
 
-    def extract_request_type(self, fields: dict[str, Any]) -> str:
-        for field_id in self.request_type_field_ids:
-            parsed = self._parse_region_value(fields.get(field_id))
-            if parsed:
-                return parsed
+    def extract_request_type(self, base_url: str, token: str, issue: dict[str, Any]) -> str:
+        issue_key = str(issue.get("key") or "").strip()
+        if not issue_key:
+            return "Не указан"
 
+        cached = self.issue_request_type_cache.get(issue_key)
+        if cached:
+            return cached
+
+        url = f"{base_url.rstrip('/')}/rest/servicedeskapi/request/{issue_key}"
+        response = self.session.get(url, headers=self._headers(token), timeout=20)
+        if response.ok:
+            response_data = response.json()
+            data = response_data if isinstance(response_data, dict) else {}
+            request_type_id = str(data.get("requestTypeId") or "").strip()
+            if request_type_id:
+                name = self.request_type_name_map.get(request_type_id, request_type_id)
+                self.issue_request_type_cache[issue_key] = name
+                return name
+
+        fields = issue.get("fields", {}) or {}
         for key, value in fields.items():
             readable = self.field_name_map.get(key, key).strip().lower()
             if readable in {"тип запроса", "тип обращения", "request type"}:
                 parsed = self._parse_region_value(value)
                 if parsed:
+                    self.issue_request_type_cache[issue_key] = parsed
                     return parsed
 
         return "Не указан"
@@ -763,7 +801,7 @@ class CompletedWindow(QWidget):
         )
         request_types = sorted(
             {
-                self.tray_app.client.extract_request_type(issue.get("fields", {}) or {})
+                self.tray_app.get_request_type(issue)
                 for issue in self.all_issues
             }
         )
@@ -818,7 +856,7 @@ class CompletedWindow(QWidget):
             category = self.tray_app.classify_issue_category(fields)
             status_name = self._status_name(fields)
             region_name = self.tray_app.client.extract_region(fields)
-            request_type = self.tray_app.client.extract_request_type(fields)
+            request_type = self.tray_app.get_request_type(issue)
 
             if selected_category != "Все категории" and category != selected_category:
                 continue
@@ -887,9 +925,18 @@ class CompletedWindow(QWidget):
 
         analytics_total = len((self.analytics_data or {}).get("completed_records", []))
         taken_count = int((self.analytics_data or {}).get("taken_count", 0))
+        today_key = datetime.now().strftime("%Y-%m-%d")
+        daily_created_seen = int((self.analytics_data or {}).get("daily_created_seen", {}).get(today_key, 0))
+        daily_closed = int((self.analytics_data or {}).get("daily_closed", {}).get(today_key, 0))
+        reaction_values = [
+            int(item.get("reaction_minutes"))
+            for item in (self.analytics_data or {}).get("completed_records", [])
+            if isinstance(item, dict) and item.get("reaction_minutes") is not None
+        ]
+        avg_reaction = int(sum(reaction_values) / len(reaction_values)) if reaction_values else 0
         request_type_counts: dict[str, int] = {}
         for issue in issues:
-            request_type = self.tray_app.client.extract_request_type(issue.get("fields", {}) or {})
+            request_type = self.tray_app.get_request_type(issue)
             if request_type and request_type != "Не указан":
                 request_type_counts[request_type] = request_type_counts.get(request_type, 0) + 1
 
@@ -904,6 +951,9 @@ class CompletedWindow(QWidget):
             f"Прочее {by_category.get('Прочее', 0)} | "
             f"накоплено без дублей {analytics_total} | "
             f"взято в работу {taken_count} | "
+            f"сегодня создано {daily_created_seen} | "
+            f"сегодня закрыто {daily_closed} | "
+            f"ср. реакция {avg_reaction} мин | "
             f"типы запроса: {request_type_stats}"
         )
 
@@ -1322,7 +1372,12 @@ class DashboardWindow(QWidget):
             "new_blue_count": 0,
             "new_work_count": 0,
             "completed_records": [],
+            "first_seen_by_key": {},
+            "daily_created_seen": {},
+            "daily_closed": {},
         }
+        self.tray_app.duplicate_hints_shown.clear()
+        self.tray_app.alerted_unassigned_keys.clear()
         self.tray_app.persist_state()
         self.tray_app.update_tray_tooltip()
         self.tray_app.emit_stats()
@@ -1555,6 +1610,101 @@ class TrayApp:
             return "Регионы"
         return "Прочее"
 
+    def get_request_type(self, issue: dict[str, Any]) -> str:
+        base_url = self.config.get("base_url", "").strip()
+        token = self.config.get("token", "").strip()
+        if not base_url or not token:
+            return "Не указан"
+        return self.client.extract_request_type(base_url, token, issue)
+
+    @staticmethod
+    def _tokenize_summary(text: str) -> set[str]:
+        stopwords = {
+            "и", "или", "для", "что", "как", "это", "при", "надо", "нужно",
+            "the", "and", "for", "with", "from", "user", "jira",
+        }
+        tokens = set()
+        for raw in text.lower().replace("/", " ").replace("-", " ").split():
+            token = "".join(ch for ch in raw if ch.isalnum())
+            if len(token) >= 4 and token not in stopwords:
+                tokens.add(token)
+        return tokens
+
+    def _find_similar_issue_key(self, issue: dict[str, Any]) -> str:
+        fields = issue.get("fields", {}) or {}
+        summary = str(fields.get("summary") or "")
+        source_tokens = self._tokenize_summary(summary)
+        if len(source_tokens) < 2:
+            return ""
+
+        candidates = self.current_red_issues + self.current_blue_issues + self.current_work_issues
+        issue_key = str(issue.get("key") or "")
+        best_key = ""
+        best_score = 0.0
+        for candidate in candidates:
+            candidate_key = str(candidate.get("key") or "")
+            if not candidate_key or candidate_key == issue_key:
+                continue
+            c_fields = candidate.get("fields", {}) or {}
+            c_summary = str(c_fields.get("summary") or "")
+            candidate_tokens = self._tokenize_summary(c_summary)
+            if not candidate_tokens:
+                continue
+            intersection = source_tokens & candidate_tokens
+            if len(intersection) < 2:
+                continue
+            score = len(intersection) / max(1, min(len(source_tokens), len(candidate_tokens)))
+            if score > best_score:
+                best_score = score
+                best_key = candidate_key
+        return best_key if best_score >= 0.6 else ""
+
+    def _track_daily_created_seen(self, issues: list[dict[str, Any]]) -> None:
+        first_seen_map = self.analytics.get("first_seen_by_key", {})
+        daily_created_seen = self.analytics.get("daily_created_seen", {})
+        now = datetime.now()
+        today_key = now.strftime("%Y-%m-%d")
+
+        for issue in issues:
+            issue_key = str(issue.get("key") or "").strip()
+            if not issue_key or issue_key in first_seen_map:
+                continue
+            first_seen_map[issue_key] = now.isoformat()
+            daily_created_seen[today_key] = self._safe_int(daily_created_seen.get(today_key, 0)) + 1
+
+        self.analytics["first_seen_by_key"] = first_seen_map
+        self.analytics["daily_created_seen"] = daily_created_seen
+
+    def _track_unassigned_alerts(self, issues: list[dict[str, Any]]) -> None:
+        threshold_minutes = self._safe_int(self.config.get("unassigned_alert_minutes", 30))
+        alerted = self.alerted_unassigned_keys
+        now = datetime.now()
+
+        for issue in issues:
+            issue_key = str(issue.get("key") or "").strip()
+            if not issue_key or issue_key in alerted:
+                continue
+            fields = issue.get("fields", {}) or {}
+            if fields.get("assignee"):
+                continue
+
+            created_raw = str(fields.get("created") or "").strip()
+            if not created_raw:
+                continue
+            try:
+                created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                continue
+            age_minutes = int((now - created_dt).total_seconds() // 60)
+            if age_minutes < threshold_minutes:
+                continue
+
+            region = self.client.extract_region(fields)
+            priority_prefix = "🔥 КОВРОВ " if "ковров" in region.lower() else "⚠️ "
+            self.show_qt_message(APP_TITLE, f"{priority_prefix}{issue_key} без исполнителя {age_minutes} мин")
+            self.logger.warning(f"{issue_key} без исполнителя {age_minutes} мин (регион: {region})")
+            alerted.add(issue_key)
+
     def _record_completed_analytics(self, issues: list[dict[str, Any]]) -> None:
         existing_records = self.analytics.get("completed_records", [])
         existing_ids = {
@@ -1564,6 +1714,8 @@ class TrayApp:
         }
 
         added = 0
+        daily_closed = self.analytics.get("daily_closed", {})
+        first_seen_map = self.analytics.get("first_seen_by_key", {})
         for issue in issues:
             issue_key = str(issue.get("key") or "").strip()
             fields = issue.get("fields", {}) or {}
@@ -1579,7 +1731,23 @@ class TrayApp:
             status = self.dashboard.get_status_name(fields)
             region = self.client.extract_region(fields)
             author = self.client.extract_author(fields)
-            request_type = self.client.extract_request_type(fields)
+            request_type = self.get_request_type(issue)
+            created = str(fields.get("created") or "").strip()
+            reaction_minutes = None
+            first_seen_raw = str(first_seen_map.get(issue_key) or "").strip()
+            if created and first_seen_raw:
+                try:
+                    created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    first_seen_dt = datetime.fromisoformat(first_seen_raw)
+                    reaction_minutes = int((first_seen_dt - created_dt).total_seconds() // 60)
+                except Exception:
+                    reaction_minutes = None
+
+            try:
+                resolved_date = datetime.fromisoformat(resolved.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+                daily_closed[resolved_date] = self._safe_int(daily_closed.get(resolved_date, 0)) + 1
+            except Exception:
+                pass
 
             existing_records.append(
                 {
@@ -1590,6 +1758,9 @@ class TrayApp:
                     "region": region,
                     "author": author,
                     "request_type": request_type,
+                    "created": created,
+                    "first_seen": first_seen_raw,
+                    "reaction_minutes": reaction_minutes,
                 }
             )
             existing_ids.add(record_id)
@@ -1597,6 +1768,7 @@ class TrayApp:
 
         if added:
             self.analytics["completed_records"] = existing_records
+            self.analytics["daily_closed"] = daily_closed
             self.logger.info(f"Аналитика completed обновлена, добавлено без дублей: {added}")
             self.signals.analytics_updated.emit(self.analytics)
 
@@ -1754,7 +1926,12 @@ class TrayApp:
             "new_blue_count": int(analytics_state.get("new_blue_count", 0)),
             "new_work_count": int(analytics_state.get("new_work_count", 0)),
             "completed_records": list(analytics_state.get("completed_records", [])),
+            "first_seen_by_key": dict(analytics_state.get("first_seen_by_key", {})),
+            "daily_created_seen": dict(analytics_state.get("daily_created_seen", {})),
+            "daily_closed": dict(analytics_state.get("daily_closed", {})),
         }
+        self.duplicate_hints_shown: set[str] = set(self.state.get("duplicate_hints_shown", []))
+        self.alerted_unassigned_keys: set[str] = set(self.state.get("alerted_unassigned_keys", []))
 
         self._check_in_progress = False
         self._field_map_loaded = False
@@ -1887,6 +2064,8 @@ class TrayApp:
             "last_check_time": self.last_check_time,
             "last_error": self.last_error,
             "analytics": self.analytics,
+            "duplicate_hints_shown": sorted(self.duplicate_hints_shown),
+            "alerted_unassigned_keys": sorted(self.alerted_unassigned_keys),
         }
         save_state(state)
 
@@ -1913,6 +2092,7 @@ class TrayApp:
             return
 
         self.client.fetch_fields(base_url, token)
+        self.client.fetch_request_types(base_url, token)
         self._field_map_loaded = True
         self.logger.info("Карта полей Jira загружена")
 
@@ -1977,6 +2157,7 @@ class TrayApp:
 
         def worker() -> None:
             try:
+                self.client.fetch_request_types(base_url, token)
                 issues = self.client.fetch_issues(base_url, token, completed_jql)
                 issues = self.sort_completed_issues(issues)
                 self._record_completed_analytics(issues)
@@ -2007,8 +2188,13 @@ class TrayApp:
         fields = issue.get("fields", {}) or {}
         summary = trim_text(fields.get("summary") or "Новая заявка", 140)
         issue_url = self.build_issue_url(issue_key)
+        region = self.client.extract_region(fields)
+        is_kovrov = "ковров" in region.lower()
 
-        title = f"{'🔴⚡' if is_red else '🔵'} {issue_key}"
+        if is_kovrov:
+            title = f"🔥 {issue_key}"
+        else:
+            title = f"{'🔴⚡' if is_red else '🔵'} {issue_key}"
 
         try:
             win_toast(
@@ -2098,6 +2284,8 @@ class TrayApp:
                 new_red = [issue for issue in red_issues if issue.get("key") not in self.known_red]
                 new_blue = [issue for issue in blue_issues if issue.get("key") not in self.known_blue]
                 new_work = [issue for issue in work_issues if issue.get("key") not in self.known_work]
+                self._track_daily_created_seen(new_red + new_blue + new_work)
+                self._track_unassigned_alerts(red_issues + blue_issues)
 
                 self.analytics["new_red_count"] = self._safe_int(self.analytics.get("new_red_count", 0)) + len(new_red)
                 self.analytics["new_blue_count"] = self._safe_int(self.analytics.get("new_blue_count", 0)) + len(new_blue)
@@ -2133,6 +2321,16 @@ class TrayApp:
                 self.known_red |= red_keys_now
                 self.known_blue |= blue_keys_now
                 self.known_work |= work_keys_now
+
+                for issue in new_red + new_blue:
+                    issue_key = str(issue.get("key") or "").strip()
+                    if not issue_key or issue_key in self.duplicate_hints_shown:
+                        continue
+                    similar_key = self._find_similar_issue_key(issue)
+                    if similar_key:
+                        self.logger.info(f"{issue_key}: уже есть похожая проблема {similar_key}")
+                        self.show_qt_message(APP_TITLE, f"{issue_key}: уже есть похожая проблема {similar_key}")
+                        self.duplicate_hints_shown.add(issue_key)
 
                 self.logger.info(
                     f"Найдено RED: {len(red_issues)}, BLUE: {len(blue_issues)}, WORK: {len(work_issues)}"
