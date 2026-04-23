@@ -275,20 +275,50 @@ class JiraClient:
     def fetch_request_types(self, base_url: str, token: str) -> None:
         url = f"{base_url.rstrip('/')}/rest/servicedeskapi/requesttype"
         response = self.session.get(url, headers=self._headers(token), timeout=20)
-        if not response.ok:
-            return
-        data = response.json()
-        values = data.get("values", []) if isinstance(data, dict) else []
-        if not isinstance(values, list):
-            return
         self.request_type_name_map.clear()
-        for item in values:
-            if not isinstance(item, dict):
+        if response.ok:
+            data = response.json()
+            values = data.get("values", []) if isinstance(data, dict) else []
+            if isinstance(values, list):
+                for item in values:
+                    if not isinstance(item, dict):
+                        continue
+                    request_type_id = str(item.get("id") or "").strip()
+                    request_type_name = str(item.get("name") or "").strip()
+                    if request_type_id and request_type_name:
+                        self.request_type_name_map[request_type_id] = request_type_name
+
+        # Дополнительно подтягиваем типы по каждому service desk
+        desks_url = f"{base_url.rstrip('/')}/rest/servicedeskapi/servicedesk"
+        desks_response = self.session.get(desks_url, headers=self._headers(token), timeout=20)
+        if not desks_response.ok:
+            return
+        desks_data = desks_response.json()
+        desks = desks_data.get("values", []) if isinstance(desks_data, dict) else []
+        if not isinstance(desks, list):
+            return
+
+        for desk in desks:
+            if not isinstance(desk, dict):
                 continue
-            request_type_id = str(item.get("id") or "").strip()
-            request_type_name = str(item.get("name") or "").strip()
-            if request_type_id and request_type_name:
-                self.request_type_name_map[request_type_id] = request_type_name
+            desk_id = str(desk.get("id") or "").strip()
+            if not desk_id:
+                continue
+            desk_types_url = f"{base_url.rstrip('/')}/rest/servicedeskapi/servicedesk/{desk_id}/requesttype"
+            desk_types_response = self.session.get(desk_types_url, headers=self._headers(token), timeout=20)
+            if not desk_types_response.ok:
+                continue
+            desk_types_data = desk_types_response.json()
+            desk_types = desk_types_data.get("values", []) if isinstance(desk_types_data, dict) else []
+            if not isinstance(desk_types, list):
+                continue
+            for item in desk_types:
+                if not isinstance(item, dict):
+                    continue
+                request_type_id = str(item.get("id") or "").strip()
+                request_type_name = str(item.get("name") or "").strip()
+                if request_type_id and request_type_name:
+                    self.request_type_name_map[request_type_id] = request_type_name
 
     def fetch_issues(self, base_url: str, token: str, jql: str) -> list[dict[str, Any]]:
         url = f"{base_url.rstrip('/')}/rest/api/2/search"
@@ -1549,7 +1579,7 @@ class DashboardWindow(QWidget):
         """)
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(12, 10, 10, 10)
+        layout.setContentsMargins(12, 10, 10, 14)
         layout.setSpacing(5)
 
         for index, line in enumerate(text_lines):
@@ -1591,6 +1621,7 @@ class DashboardWindow(QWidget):
             btn.clicked.connect(lambda: self.tray_app.take_issue(issue_key))
 
             bottom = QHBoxLayout()
+            bottom.setContentsMargins(0, 4, 0, 2)
             bottom.addStretch()
             bottom.addWidget(btn)
 
@@ -2240,8 +2271,11 @@ class TrayApp:
         value = str(argument or "").strip()
         if not value:
             return
-        if value.startswith("take:"):
-            issue_key = value.split(":", 1)[1].strip()
+        lowered = value.lower()
+        if lowered in {"http:взять в работу", "взять в работу"}:
+            return
+        if "take:" in lowered:
+            issue_key = value.split("take:", 1)[1].strip()
             if issue_key:
                 self.take_issue(issue_key)
             return
@@ -2268,14 +2302,16 @@ class TrayApp:
             payload = {
                 "app_id": "JiraFastWatcher4",
                 "duration": "long",
-                "actions": [
+                "buttons": [
                     {
+                        "activationType": "protocol",
                         "content": "Открыть",
-                        "arguments": issue_url
+                        "arguments": issue_url,
                     },
                     {
+                        "activationType": "protocol",
                         "content": "Взять в работу",
-                        "arguments": f"take:{issue_key}"
+                        "arguments": f"take:{issue_key}",
                     }
                 ],
                 "on_click": self.handle_toast_action,
@@ -2284,11 +2320,11 @@ class TrayApp:
             try:
                 win_toast(title, summary, **payload)
             except TypeError:
-                # fallback для версий win11toast, где используется параметр buttons
-                payload.pop("actions", None)
-                payload["buttons"] = [
-                    ("Открыть", issue_url),
-                    ("Взять в работу", f"take:{issue_key}"),
+                # fallback для старых версий win11toast, где используется actions
+                payload.pop("buttons", None)
+                payload["actions"] = [
+                    {"content": "Открыть", "arguments": issue_url},
+                    {"content": "Взять в работу", "arguments": f"take:{issue_key}"},
                 ]
                 win_toast(title, summary, **payload)
 
