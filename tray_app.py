@@ -192,6 +192,8 @@ class TrayApp:
     def _find_similar_issue_key(self, issue: dict[str, Any]) -> str:
         fields = issue.get("fields", {}) or {}
         summary = str(fields.get("summary") or "")
+        if not self._is_duplicate_candidate(summary):
+            return ""
         source_tokens = tokenize_summary(summary)
         if len(source_tokens) < 2:
             return ""
@@ -206,6 +208,8 @@ class TrayApp:
                 continue
             c_fields = candidate.get("fields", {}) or {}
             c_summary = str(c_fields.get("summary") or "")
+            if not self._is_duplicate_candidate(c_summary):
+                continue
             candidate_tokens = tokenize_summary(c_summary)
             if not candidate_tokens:
                 continue
@@ -217,6 +221,37 @@ class TrayApp:
                 best_score = score
                 best_key = candidate_key
         return best_key if best_score >= 0.6 else ""
+
+    @staticmethod
+    def _is_duplicate_candidate(summary: str) -> bool:
+        text = str(summary or "").lower()
+        excluded_keywords = [
+            "прием техники",
+            "приём техники",
+            "выдач",
+            "картридж",
+            "принтер",
+            "мфу",
+        ]
+        return not any(keyword in text for keyword in excluded_keywords)
+
+    def notify_similar_issue(self, issue_key: str, similar_key: str) -> None:
+        similar_url = self.build_issue_url(similar_key)
+        text = f"{issue_key}: уже есть похожая проблема {similar_key}"
+        self.logger.info(text)
+
+        try:
+            win_toast(
+                f"🔁 {issue_key}",
+                f"Похожа на {similar_key}. Нажми, чтобы открыть исходную заявку.",
+                app_id="JiraFastWatcher4",
+                duration="long",
+                on_click=similar_url,
+            )
+        except Exception as e:
+            self.logger.error(f"Toast error (similar issue): {e}")
+
+        self.show_qt_message(APP_TITLE, text)
 
     def _track_daily_created_seen(self, issues: list[dict[str, Any]]) -> None:
         first_seen_map = self.analytics.get("first_seen_by_key", {})
@@ -791,9 +826,12 @@ class TrayApp:
                     {"content": "Взять в работу", "arguments": f"take:{issue_key}"},
                 ]
                 win_toast(title, summary, **payload)
+            # Резервный канал через Qt-tray, чтобы не терять уведомления при ограничениях Win Toast.
+            self.show_qt_message(title, summary)
 
         except Exception as e:
             self.logger.error(f"Toast error: {e}")
+            self.show_qt_message(title, summary)
 
     def on_timer_tick(self) -> None:
         self.run_check(force_notify=False)
@@ -888,12 +926,8 @@ class TrayApp:
                 else:
                     for issue in new_red:
                         self.notify_issue(issue, is_red=True)
-
-                    if self.known_blue:
-                        for issue in new_blue:
-                            self.notify_issue(issue, is_red=False)
-                    else:
-                        self.logger.info("Первичная инициализация BLUE без уведомлений")
+                    for issue in new_blue:
+                        self.notify_issue(issue, is_red=False)
 
                 self.known_red |= red_keys_now
                 self.known_blue |= blue_keys_now
@@ -905,8 +939,7 @@ class TrayApp:
                         continue
                     similar_key = self._find_similar_issue_key(issue)
                     if similar_key:
-                        self.logger.info(f"{issue_key}: уже есть похожая проблема {similar_key}")
-                        self.show_qt_message(APP_TITLE, f"{issue_key}: уже есть похожая проблема {similar_key}")
+                        self.notify_similar_issue(issue_key, similar_key)
                         self.duplicate_hints_shown.add(issue_key)
 
                 self.logger.info(
