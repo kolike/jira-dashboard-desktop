@@ -792,15 +792,18 @@ class TrayApp:
         region = self.client.extract_region(fields)
         is_kovrov = "ковров" in region.lower()
 
-        if is_kovrov:
-            title = f"🔥 {issue_key}"
+        if is_red:
+            title = f"🔴🔥 {issue_key}" if is_kovrov else f"🔴⚡ {issue_key}"
+            icon_path = str(RED_ICON_PATH)
         else:
-            title = f"{'🔴⚡' if is_red else '🔵'} {issue_key}"
+            title = f"🔵 {issue_key}"
+            icon_path = str(BLUE_ICON_PATH)
 
         try:
             payload = {
                 "app_id": "JiraFastWatcher4",
                 "duration": "long",
+                "icon": icon_path,
                 "buttons": [
                     {
                         "activationType": "protocol",
@@ -813,8 +816,8 @@ class TrayApp:
                         "arguments": f"take:{issue_key}",
                     }
                 ],
-                # По клику по самому уведомлению всегда открываем заявку в браузере.
-                "on_click": issue_url,
+                # По клику по самому уведомлению открываем саму заявку.
+                "on_click": (lambda arg=None, url=issue_url: self.handle_toast_action(arg or url)),
                 "on_action": self.handle_toast_action,
             }
             try:
