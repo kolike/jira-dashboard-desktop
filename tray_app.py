@@ -813,7 +813,8 @@ class TrayApp:
                         "arguments": f"take:{issue_key}",
                     }
                 ],
-                "on_click": self.handle_toast_action,
+                # По клику по самому уведомлению всегда открываем заявку в браузере.
+                "on_click": issue_url,
                 "on_action": self.handle_toast_action,
             }
             try:
