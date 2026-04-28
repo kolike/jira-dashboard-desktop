@@ -804,31 +804,13 @@ class TrayApp:
                 "app_id": "JiraFastWatcher4",
                 "duration": "long",
                 "icon": icon_path,
-                "buttons": [
-                    {
-                        "activationType": "protocol",
-                        "content": "Открыть",
-                        "arguments": issue_url,
-                    },
-                    {
-                        "activationType": "protocol",
-                        "content": "Взять в работу",
-                        "arguments": f"take:{issue_key}",
-                    }
-                ],
-                # По клику по самому уведомлению открываем саму заявку.
-                "on_click": (lambda arg=None, url=issue_url: self.handle_toast_action(arg or url)),
-                "on_action": self.handle_toast_action,
+                # По клику по уведомлению сразу открываем заявку в браузере.
+                "on_click": (lambda *_args, url=issue_url: webbrowser.open(url)),
             }
             try:
                 win_toast(title, summary, **payload)
             except TypeError:
-                # fallback для старых версий win11toast, где используется actions
-                payload.pop("buttons", None)
-                payload["actions"] = [
-                    {"content": "Открыть", "arguments": issue_url},
-                    {"content": "Взять в работу", "arguments": f"take:{issue_key}"},
-                ]
+                # fallback для старых сигнатур win11toast
                 win_toast(title, summary, **payload)
             # Резервный канал через Qt-tray, чтобы не терять уведомления при ограничениях Win Toast.
             self.show_qt_message(title, summary)
