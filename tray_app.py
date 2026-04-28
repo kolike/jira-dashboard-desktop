@@ -36,6 +36,7 @@ from storage import (
     load_state,
     save_config,
     save_state,
+    trim_text,
 )
 from ui_completed import CompletedWindow
 from ui_dashboard import DashboardWindow
