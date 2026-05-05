@@ -7,7 +7,7 @@ from typing import Any
 
 from requests.exceptions import RequestException
 from PySide6.QtCore import QObject, Signal, Slot, Qt, QTimer
-from PySide6.QtGui import QTextCursor, QCursor, QIcon, QAction
+from PySide6.QtGui import QTextCursor, QCursor, QIcon, QAction, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -549,6 +549,9 @@ class TrayApp:
         self.tray_icon.setIcon(self.icon)
         self.tray_icon.setToolTip(APP_TITLE)
 
+        if not self.icon.isNull():
+            self.app.setWindowIcon(self.icon)
+
         self.dashboard = DashboardWindow(self)
         self.settings_window = SettingsWindow(self)
         self.log_window = LogWindow(self)
@@ -636,7 +639,11 @@ class TrayApp:
 
         self.tray_icon.setContextMenu(self.menu)
         self.tray_icon.activated.connect(self.on_tray_activated)
-        self.tray_icon.show()
+
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon.show()
+        else:
+            self.logger.warning("Системный трей недоступен: окно будет оставаться в панели задач")
 
 
     def persist_state(self) -> None:
@@ -707,27 +714,30 @@ class TrayApp:
             self.last_error,
         )
 
+    def _present_window(self, window: QWidget) -> None:
+        if window.isMinimized():
+            window.setWindowState((window.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+        # Надежный fallback для Windows: поднимаем окно, даже если фокус украден другим приложением.
+        if sys.platform.startswith("win"):
+            QGuiApplication.alert(window, 2000)
+
     def show_dashboard(self) -> None:
-        self.dashboard.show()
-        self.dashboard.raise_()
-        self.dashboard.activateWindow()
+        self._present_window(self.dashboard)
 
     def show_settings(self) -> None:
         self.settings_window.load_into_form()
-        self.settings_window.show()
-        self.settings_window.raise_()
-        self.settings_window.activateWindow()
+        self._present_window(self.settings_window)
 
     def show_log_window(self) -> None:
         self.log_window.hydrate_from_memory()
-        self.log_window.show()
-        self.log_window.raise_()
-        self.log_window.activateWindow()
+        self._present_window(self.log_window)
 
     def show_completed_window(self) -> None:
-        self.completed_window.show()
-        self.completed_window.raise_()
-        self.completed_window.activateWindow()
+        self._present_window(self.completed_window)
         self.load_completed_issues()
 
     def load_completed_issues(self) -> None:
