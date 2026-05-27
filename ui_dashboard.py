@@ -27,43 +27,71 @@ class NeonCard(QFrame):
         self.setObjectName("NeonCard")
 
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(18)
-        shadow.setOffset(0, 0)
-        shadow.setColor(QColor(accent))
+        shadow.setBlurRadius(22)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QColor(0, 0, 0, 90))
         self.setGraphicsEffect(shadow)
 
         self.title_label = QLabel(title)
         self.title_label.setObjectName("CardTitle")
+        self.title_label.setProperty("accent", accent)
+
+        self.count_label = QLabel("0")
+        self.count_label.setObjectName("CardCount")
+        self.count_label.setAlignment(Qt.AlignCenter)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
+        title_row.addWidget(self.title_label)
+        title_row.addStretch()
+        title_row.addWidget(self.count_label)
 
         self.body_layout = QVBoxLayout()
         self.body_layout.setContentsMargins(0, 0, 0, 0)
-        self.body_layout.setSpacing(8)
+        self.body_layout.setSpacing(10)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(12, 10, 12, 12)
-        layout.setSpacing(8)
-        layout.addWidget(self.title_label)
+        layout.setSpacing(10)
+        layout.addLayout(title_row)
         layout.addLayout(self.body_layout)
         self.setLayout(layout)
 
         self.setStyleSheet(
             f"""
             QFrame#NeonCard {{
-                background: rgba(13, 17, 29, 242);
-                border: 1px solid {accent};
-                border-radius: 18px;
+                background: #111827;
+                border: 1px solid #263244;
+                border-top: 2px solid {accent};
+                border-radius: 8px;
             }}
             QLabel#CardTitle {{
-                color: #F4F7FF;
-                font-size: 17px;
-                font-weight: 900;
-                letter-spacing: 1px;
+                color: #F8FAFC;
+                font-size: 14px;
+                font-weight: 800;
+                letter-spacing: 0px;
                 padding-left: 2px;
                 background: transparent;
                 border: none;
             }}
+            QLabel#CardCount {{
+                min-width: 28px;
+                max-width: 42px;
+                min-height: 22px;
+                max-height: 22px;
+                color: #E2E8F0;
+                background: #172033;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                font-size: 12px;
+                font-weight: 900;
+            }}
             """
         )
+
+    def set_count(self, value: int) -> None:
+        self.count_label.setText(str(value))
 
 
 class MetricCard(QFrame):
@@ -76,30 +104,32 @@ class MetricCard(QFrame):
         self.label.setObjectName("MetricLabel")
         self.value.setObjectName("MetricValue")
         self.value.setWordWrap(True)
-        self.value.setAlignment(Qt.AlignCenter)
+        self.value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.setMinimumHeight(64)
 
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(16)
-        shadow.setOffset(0, 0)
-        shadow.setColor(QColor(accent))
+        shadow.setBlurRadius(18)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 70))
         self.setGraphicsEffect(shadow)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(4)
-        layout.addWidget(self.label, 0, Qt.AlignCenter)
-        layout.addWidget(self.value, 1, Qt.AlignCenter)
+        layout.addWidget(self.label)
+        layout.addWidget(self.value)
         self.setLayout(layout)
 
         self.setStyleSheet(
             f"""
             QFrame {{
-                background: rgba(15, 19, 34, 240);
-                border: 1px solid {accent};
-                border-radius: 16px;
+                background: #0F172A;
+                border: 1px solid #263244;
+                border-left: 3px solid {accent};
+                border-radius: 8px;
             }}
             QLabel#MetricLabel {{
-                color: #9FB0D8;
+                color: #94A3B8;
                 font-size: 11px;
                 font-weight: 700;
                 background: transparent;
@@ -108,8 +138,8 @@ class MetricCard(QFrame):
                 margin: 0;
             }}
             QLabel#MetricValue {{
-                color: #F4F7FF;
-                font-size: 17px;
+                color: #F8FAFC;
+                font-size: 18px;
                 font-weight: 900;
                 background: transparent;
                 border: none;
@@ -142,15 +172,15 @@ class StatusIconButton(QToolButton):
 
     def update_style(self) -> None:
         if self._active:
-            border = "#D7FF4A"
-            bg = "rgba(23, 31, 45, 245)"
-            color = "#EDFFD8"
-            glow_color = QColor(215, 255, 74, 170)
+            border = "#2DD4BF"
+            bg = "#12343A"
+            color = "#ECFEFF"
+            glow_color = QColor(0, 0, 0, 75)
         else:
-            border = "#4B5568"
-            bg = "rgba(18, 24, 38, 235)"
-            color = "#D3DBEA"
-            glow_color = QColor(88, 96, 115, 90)
+            border = "#334155"
+            bg = "#111827"
+            color = "#CBD5E1"
+            glow_color = QColor(0, 0, 0, 55)
 
         self.setStyleSheet(
             f"""
@@ -158,18 +188,18 @@ class StatusIconButton(QToolButton):
                 background: {bg};
                 color: {color};
                 border: 1px solid {border};
-                border-radius: 21px;
+                border-radius: 8px;
             }}
             QToolButton:hover {{
-                border: 1px solid #7EB7FF;
-                background: rgba(24, 31, 49, 250);
+                border: 1px solid #38BDF8;
+                background: #172033;
             }}
             """
         )
 
         shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(16 if self._active else 8)
-        shadow.setOffset(0, 0)
+        shadow.setBlurRadius(14 if self._active else 10)
+        shadow.setOffset(0, 5)
         shadow.setColor(glow_color)
         self.setGraphicsEffect(shadow)
 
@@ -192,12 +222,12 @@ class BubbleGridWidget(QListWidget):
 
         self.setStyleSheet(f"""
             QListWidget {{
-                background: transparent;
+                background: #0B1120;
                 border: none;
                 outline: none;
-                color: #F3F6FF;
+                color: #F8FAFC;
                 font-size: 12px;
-                padding: 0px;
+                padding: 6px;
             }}
 
             QListWidget::item {{
@@ -213,13 +243,13 @@ class BubbleGridWidget(QListWidget):
             }}
 
             QScrollBar::handle:vertical {{
-                background: rgba(255,255,255,0.18);
+                background: #334155;
                 border-radius: 4px;
                 min-height: 20px;
             }}
 
             QScrollBar::handle:vertical:hover {{
-                background: rgba(255,255,255,0.30);
+                background: #475569;
             }}
 
             QScrollBar::add-line:vertical,
@@ -234,36 +264,35 @@ class DashboardWindow(QWidget):
     def __init__(self, tray_app: "TrayApp") -> None:
         super().__init__()
         self.tray_app = tray_app
+        self.setFont(QFont("Segoe UI", 10))
 
         self.setWindowTitle(APP_TITLE)
         self.resize(1180, 760)
         self.setMinimumSize(1080, 700)
-        self.setMaximumHeight(820)
 
         self.setStyleSheet(
             """
             QWidget {
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:1,
-                    stop:0 #060B18, stop:0.55 #0B1326, stop:1 #091426);
-                color: #F4F7FF;
-                font-family: Segoe UI, Arial, sans-serif;
+                background: #0B1020;
+                color: #F8FAFC;
+                font-family: "Segoe UI", Tahoma, Arial, sans-serif;
             }
             QLabel {
                 background: transparent;
                 border: none;
             }
             QLabel#MainTitle {
-                color: #F8FCFF;
-                font-size: 25px;
+                color: #F8FAFC;
+                font-size: 23px;
                 font-weight: 900;
-                letter-spacing: 1.4px;
+                letter-spacing: 0px;
                 background: transparent;
                 border: none;
             }
             QLabel#SubTitle {
-                color: #A6B8E6;
+                color: #94A3B8;
                 font-size: 12px;
-                font-weight: 700;
+                font-weight: 600;
                 background: transparent;
                 border: none;
             }
@@ -295,18 +324,18 @@ class DashboardWindow(QWidget):
         self.actions_menu.setStyleSheet(
             """
             QMenu {
-                background: #101625;
-                color: #F3F6FF;
-                border: 1px solid #33405F;
-                border-radius: 12px;
+                background: #111827;
+                color: #F8FAFC;
+                border: 1px solid #263244;
+                border-radius: 8px;
                 padding: 6px;
             }
             QMenu::item {
                 padding: 8px 20px 8px 12px;
-                border-radius: 8px;
+                border-radius: 6px;
             }
             QMenu::item:selected {
-                background: #1E2A45;
+                background: #1E293B;
             }
             """
         )
@@ -337,16 +366,30 @@ class DashboardWindow(QWidget):
         controls_layout.addWidget(self.menu_button)
 
         header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(12, 10, 12, 10)
         header_layout.setSpacing(10)
         header_layout.addLayout(title_layout)
         header_layout.addStretch()
         header_layout.addLayout(controls_layout)
 
-        self.metric_red = MetricCard("КОВРОВ", "#FF4976")
-        self.metric_blue = MetricCard("РЕГИОНЫ", "#56A6FF")
-        self.metric_work = MetricCard("В РАБОТЕ", "#7CFFBE")
-        self.metric_last = MetricCard("ПОСЛЕДНЯЯ ПРОВЕРКА", "#D7FF51")
-        self.metric_error = MetricCard("ПОСЛЕДНЯЯ ОШИБКА", "#FFC66D")
+        header_panel = QFrame()
+        header_panel.setObjectName("HeaderPanel")
+        header_panel.setLayout(header_layout)
+        header_panel.setStyleSheet(
+            """
+            QFrame#HeaderPanel {
+                background: #111827;
+                border: 1px solid #263244;
+                border-radius: 8px;
+            }
+            """
+        )
+
+        self.metric_red = MetricCard("КОВРОВ", "#F43F5E")
+        self.metric_blue = MetricCard("РЕГИОНЫ", "#38BDF8")
+        self.metric_work = MetricCard("В РАБОТЕ", "#22C55E")
+        self.metric_last = MetricCard("ПОСЛЕДНЯЯ ПРОВЕРКА", "#F59E0B")
+        self.metric_error = MetricCard("ПОСЛЕДНЯЯ ОШИБКА", "#FB7185")
 
         metrics_layout = QHBoxLayout()
         metrics_layout.setSpacing(8)
@@ -356,13 +399,16 @@ class DashboardWindow(QWidget):
         metrics_layout.addWidget(self.metric_last)
         metrics_layout.addWidget(self.metric_error)
 
-        self.red_card = NeonCard("КОВРОВ", "#FF4C7A")
-        self.blue_card = NeonCard("РЕГИОНЫ", "#4EA5FF")
-        self.work_card = NeonCard("В РАБОТЕ", "#68FFC0")
+        self.red_card = NeonCard("КОВРОВ", "#F43F5E")
+        self.blue_card = NeonCard("РЕГИОНЫ", "#38BDF8")
+        self.work_card = NeonCard("В РАБОТЕ", "#22C55E")
 
-        self.red_list = BubbleGridWidget("#FF4C7A", QSize(255, 92))
-        self.blue_list = BubbleGridWidget("#4EA5FF", QSize(255, 92))
-        self.work_list = BubbleGridWidget("#68FFC0", QSize(285, 140))
+        self.red_list = BubbleGridWidget("#F43F5E", QSize(255, 104))
+        self.blue_list = BubbleGridWidget("#38BDF8", QSize(255, 104))
+        self.work_list = BubbleGridWidget("#22C55E", QSize(285, 132))
+        self.red_list.setMinimumHeight(250)
+        self.blue_list.setMinimumHeight(250)
+        self.work_list.setMinimumHeight(250)
 
         self.red_list.itemClicked.connect(self.open_issue_from_item)
         self.blue_list.itemClicked.connect(self.open_issue_from_item)
@@ -378,9 +424,9 @@ class DashboardWindow(QWidget):
         top_split_layout.addWidget(self.blue_card, 1)
 
         root_layout = QVBoxLayout()
-        root_layout.setContentsMargins(14, 14, 14, 14)
-        root_layout.setSpacing(10)
-        root_layout.addLayout(header_layout)
+        root_layout.setContentsMargins(16, 14, 16, 16)
+        root_layout.setSpacing(12)
+        root_layout.addWidget(header_panel)
         root_layout.addLayout(metrics_layout)
         root_layout.addLayout(top_split_layout, 1)
         root_layout.addWidget(self.work_card, 1)
@@ -456,14 +502,17 @@ class DashboardWindow(QWidget):
 
     @Slot(list)
     def update_red_issues(self, issues: list[dict[str, Any]]) -> None:
+        self.red_card.set_count(len(issues))
         self.fill_bubbles(self.red_list, issues, self.format_red_issue)
 
     @Slot(list)
     def update_blue_issues(self, issues: list[dict[str, Any]]) -> None:
+        self.blue_card.set_count(len(issues))
         self.fill_bubbles(self.blue_list, issues, self.format_blue_issue)
 
     @Slot(list)
     def update_work_issues(self, issues: list[dict[str, Any]]) -> None:
+        self.work_card.set_count(len(issues))
         self.fill_work_bubbles(self.work_list, issues)
 
     @Slot(bool)
@@ -475,9 +524,14 @@ class DashboardWindow(QWidget):
 
         if not issues:
             item = QListWidgetItem("Сейчас пусто")
-            item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            item.setSizeHint(QSize(260, 124))
+            item.setSizeHint(QSize(260, 92))
             widget.addItem(item)
+            empty_card = self.build_issue_card_widget(
+                [item.text()],
+                "#64748B",
+                show_button=False,
+            )
+            widget.setItemWidget(item, empty_card)
             return
 
         for issue in issues:
@@ -485,7 +539,7 @@ class DashboardWindow(QWidget):
             text, tooltip = formatter(issue)
             item = QListWidgetItem()
             item.setData(Qt.UserRole, self.tray_app.build_issue_url(issue_key))
-            item.setSizeHint(QSize(260, 110))
+            item.setSizeHint(QSize(260, 104))
             widget.addItem(item)
 
             card = self.build_issue_card_widget(
@@ -506,7 +560,7 @@ class DashboardWindow(QWidget):
             widget.addItem(item)
             empty_card = self.build_issue_card_widget(
                 ["Сейчас пусто"],
-                "#68FFC0",
+                "#64748B",
             )
             widget.setItemWidget(item, empty_card)
             return
@@ -536,7 +590,7 @@ class DashboardWindow(QWidget):
             item = QListWidgetItem()
             item.setData(Qt.UserRole, self.tray_app.build_issue_url(issue_key))
             item.setToolTip(tooltip)
-            item.setSizeHint(QSize(260, 124))
+            item.setSizeHint(QSize(285, 126))
             widget.addItem(item)
 
             card = self.build_issue_card_widget(lines, accent, issue_key, show_button=False)
@@ -544,36 +598,46 @@ class DashboardWindow(QWidget):
 
     def build_issue_card_widget(self, text_lines, accent, issue_key=None, show_button=True):
         accent = accent or "#6EA8FF"
-        soft_bg = "rgba(12, 17, 30, 230)"
-        if accent.lower() in {"#00ffa6", "#68ffc0"}:
-            soft_bg = "rgba(14, 28, 24, 236)"
-        elif accent.lower() == "#6b7280":
-            soft_bg = "rgba(24, 26, 32, 230)"
+        accent_key = accent.lower()
+        soft_bg = "#111827"
+        text_muted = "#94A3B8"
+        if accent_key in {"#22c55e", "#00ffa6", "#68ffc0"}:
+            soft_bg = "#0F241B"
+            text_muted = "#86EFAC"
+        elif accent_key in {"#64748b", "#6b7280"}:
+            soft_bg = "#111827"
+            text_muted = "#94A3B8"
 
         frame = QFrame()
         frame.setObjectName("IssueCard")
+        shadow = QGraphicsDropShadowEffect(frame)
+        shadow.setBlurRadius(16)
+        shadow.setOffset(0, 5)
+        shadow.setColor(QColor(0, 0, 0, 70))
+        frame.setGraphicsEffect(shadow)
         frame.setStyleSheet(f"""
             QFrame#IssueCard {{
                 background: {soft_bg};
-                border: 1px solid {accent};
-                border-radius: 16px;
+                border: 1px solid #263244;
+                border-left: 3px solid {accent};
+                border-radius: 8px;
             }}
         """)
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(12, 10, 10, 14)
-        layout.setSpacing(5)
+        layout.setContentsMargins(12, 9, 10, 10)
+        layout.setSpacing(4)
 
         for index, line in enumerate(text_lines):
             label = QLabel(line)
             label.setWordWrap(True)
 
             if index == 0:
-                label.setStyleSheet("color:#FFFFFF;font-size:14px;font-weight:800;")
+                label.setStyleSheet("color:#F8FAFC;font-size:14px;font-weight:900;")
             elif line.startswith("Автор:"):
-                label.setStyleSheet("color:#9FB0D8;font-size:12px;")
+                label.setStyleSheet(f"color:{text_muted};font-size:12px;")
             else:
-                label.setStyleSheet("color:#DCE6FF;font-size:12px;")
+                label.setStyleSheet("color:#CBD5E1;font-size:12px;")
 
             layout.addWidget(label)
 
@@ -585,18 +649,17 @@ class DashboardWindow(QWidget):
 
             btn.setStyleSheet("""
                 QPushButton {
-                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
-                        stop:0 rgba(71, 149, 255, 0.30),
-                        stop:1 rgba(104, 255, 214, 0.28));
-                    color: #E7F4FF;
-                    border: 1px solid rgba(126,183,255,0.85);
-                    border-radius: 8px;
+                    background: #2563EB;
+                    color: #FFFFFF;
+                    border: 1px solid #3B82F6;
+                    border-radius: 7px;
                     font-size: 11px;
                     font-weight: 800;
-                    padding: 2px 8px;
+                    padding: 2px 10px;
                 }
                 QPushButton:hover {
-                    background: rgba(89, 172, 255, 0.45);
+                    background: #1D4ED8;
+                    border: 1px solid #60A5FA;
                 }
             """)
 
@@ -616,12 +679,12 @@ class DashboardWindow(QWidget):
         status = self.get_status_name(fields).lower()
 
         if "отлож" in status:
-            return "#6B7280"   # серый
+            return "#64748B"   # серый
 
         if "работ" in status:
-            return "#00FFA6"   # яркий (в работе)
+            return "#22C55E"   # яркий (в работе)
 
-        return "#68FFC0"       # дефолт
+        return "#64748B"       # дефолт
 
     def format_red_issue(self, issue: dict[str, Any]) -> tuple[str, str]:
         fields = issue.get("fields", {}) or {}

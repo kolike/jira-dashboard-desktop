@@ -2,12 +2,13 @@ import logging
 import sys
 import threading
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any
 
 from requests.exceptions import RequestException
 from PySide6.QtCore import QObject, Signal, Slot, Qt, QTimer
-from PySide6.QtGui import QTextCursor, QCursor, QIcon, QAction, QGuiApplication
+from PySide6.QtGui import QTextCursor, QCursor, QIcon, QAction
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -24,7 +25,7 @@ try:
 except ImportError:
     from win11toast import notify as win_toast
 
-from jira_client import JiraClient
+from jira_client import JiraClient, REQUEST_TIMEOUT
 from analytics import overlap_score, tokenize_summary
 from storage import (
     APP_ICON_ICO,
@@ -374,7 +375,12 @@ class TrayApp:
             raise ValueError("Не заполнены base_url/token")
 
         url = f"{base_url}/rest/api/2/myself"
-        response = self.client.session.get(url, headers=self.client._headers(token), timeout=20)
+        cache_key = f"{base_url}|{token}"
+        cached = self._assignee_payload_cache.get(cache_key)
+        if cached:
+            return cached
+
+        response = self.client.session.get(url, headers=self.client._headers(token), timeout=REQUEST_TIMEOUT)
         if not response.ok:
             raise RequestException(f"Не удалось определить текущего пользователя: HTTP {response.status_code}")
 
@@ -385,12 +391,16 @@ class TrayApp:
         user_key = str(me.get("key") or "").strip()
 
         if account_id:
-            return {"accountId": account_id}
-        if user_name:
-            return {"name": user_name}
-        if user_key:
-            return {"name": user_key}
-        return {"name": "-1"}
+            payload = {"accountId": account_id}
+        elif user_name:
+            payload = {"name": user_name}
+        elif user_key:
+            payload = {"name": user_key}
+        else:
+            payload = {"name": "-1"}
+
+        self._assignee_payload_cache[cache_key] = payload
+        return payload
 
     @staticmethod
     def _find_in_progress_transition_id(transitions: list[dict[str, Any]]) -> str:
@@ -427,7 +437,7 @@ class TrayApp:
         response = self.client.session.get(
             transitions_url,
             headers=self.client._headers(token),
-            timeout=20,
+            timeout=REQUEST_TIMEOUT,
         )
         if not response.ok:
             raise RequestException(f"Не удалось получить переходы: HTTP {response.status_code}")
@@ -448,7 +458,7 @@ class TrayApp:
             transitions_url,
             json=payload,
             headers=self.client._headers(token),
-            timeout=20,
+            timeout=REQUEST_TIMEOUT,
         )
         if transition_response.status_code not in (200, 204):
             raise RequestException(
@@ -456,42 +466,70 @@ class TrayApp:
             )
         return True
 
-    def take_issue(self, issue_key: str):
-        try:
-            base_url = self.config.get("base_url", "").rstrip("/")
-            token = self.config.get("token", "").strip()
-            if not base_url or not token:
-                raise ValueError("Заполни URL и токен в настройках")
+    def take_issue(self, issue_key: str) -> None:
+        issue_key = str(issue_key or "").strip()
+        if not issue_key:
+            self.logger.warning("Empty issue key for take operation")
+            return
 
-            url = f"{base_url}/rest/api/2/issue/{issue_key}/assignee"
-            payload = self._jira_assignee_payload()
+        with self._take_lock:
+            if issue_key in self._take_in_progress_keys:
+                self.logger.info(f"{issue_key}: take operation is already running")
+                return
+            self._take_in_progress_keys.add(issue_key)
 
-            response = self.client.session.put(
-                url,
-                json=payload,
-                headers=self.client._headers(token),
-                timeout=20,
-            )
+        def worker() -> None:
+            try:
+                base_url = self.config.get("base_url", "").rstrip("/")
+                token = self.config.get("token", "").strip()
+                if not base_url or not token:
+                    raise ValueError("Заполни URL и токен в настройках")
 
-            if response.status_code in (200, 204):
-                moved_to_work = self._move_issue_to_in_progress(issue_key)
-                if moved_to_work:
-                    self.logger.info(f"{issue_key} назначена и переведена в работу")
-                    self.show_qt_message("Jira", f"{issue_key} назначена и переведена в работу")
+                url = f"{base_url}/rest/api/2/issue/{issue_key}/assignee"
+                payload = self._jira_assignee_payload()
+
+                response = self.client.session.put(
+                    url,
+                    json=payload,
+                    headers=self.client._headers(token),
+                    timeout=REQUEST_TIMEOUT,
+                )
+
+                if response.status_code in (200, 204):
+                    self._remove_issue_from_unassigned_lists(issue_key)
+                    moved_to_work = self._move_issue_to_in_progress(issue_key)
+                    if moved_to_work:
+                        self.logger.info(f"{issue_key} назначена и переведена в работу")
+                        self.show_qt_message("Jira", f"{issue_key} назначена и переведена в работу")
+                    else:
+                        self.logger.info(f"{issue_key} назначена, но переход в работу не найден")
+                        self.show_qt_message("Jira", f"{issue_key} назначена (переход в работу не найден)")
+                    self.analytics["taken_count"] = self._safe_int(self.analytics.get("taken_count", 0)) + 1
+                    self.signals.analytics_updated.emit(self.analytics)
+
+                    # обновляем список без шквала уведомлений
+                    self.run_check(force_notify=False)
                 else:
-                    self.logger.info(f"{issue_key} назначена, но переход в работу не найден")
-                    self.show_qt_message("Jira", f"{issue_key} назначена (переход в работу не найден)")
-                self.analytics["taken_count"] = self._safe_int(self.analytics.get("taken_count", 0)) + 1
-                self.signals.analytics_updated.emit(self.analytics)
+                    raise Exception(f"HTTP {response.status_code}: {response.text}")
 
-                # обновляем список
-                self.run_check(force_notify=True)
-            else:
-                raise Exception(f"HTTP {response.status_code}: {response.text}")
+            except Exception as e:
+                self.logger.error(f"Ошибка взятия {issue_key}: {e}")
+                self.show_qt_message("Ошибка", str(e))
+            finally:
+                with self._take_lock:
+                    self._take_in_progress_keys.discard(issue_key)
 
-        except Exception as e:
-            self.logger.error(f"Ошибка взятия {issue_key}: {e}")
-            self.show_qt_message("Ошибка", str(e))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _remove_issue_from_unassigned_lists(self, issue_key: str) -> None:
+        self.current_red_issues = [issue for issue in self.current_red_issues if issue.get("key") != issue_key]
+        self.current_blue_issues = [issue for issue in self.current_blue_issues if issue.get("key") != issue_key]
+        self.current_red_keys.discard(issue_key)
+        self.current_blue_keys.discard(issue_key)
+        self.signals.red_issues_updated.emit(self.current_red_issues)
+        self.signals.blue_issues_updated.emit(self.current_blue_issues)
+        self.update_tray_tooltip()
+        self.emit_stats()
 
     def __init__(self, app: QApplication) -> None:
         self.app = app
@@ -529,7 +567,12 @@ class TrayApp:
         self.alerted_unassigned_keys: set[str] = set(self.state.get("alerted_unassigned_keys", []))
 
         self._check_in_progress = False
+        self._check_again_requested = False
+        self._check_lock = threading.Lock()
+        self._take_in_progress_keys: set[str] = set()
+        self._take_lock = threading.Lock()
         self._field_map_loaded = False
+        self._assignee_payload_cache: dict[str, dict[str, str]] = {}
 
         if APP_ICON_ICO.exists():
             self.icon = QIcon(str(APP_ICON_ICO))
@@ -575,6 +618,8 @@ class TrayApp:
         self.show_dashboard()
         self.show_qt_message(APP_TITLE, "Приложение запущено")
         self.logger.info("Приложение запущено")
+
+        QTimer.singleShot(0, self.run_check)
 
     def setup_logging(self) -> None:
         self.logger = logging.getLogger("jira-fast-watcher")
@@ -663,7 +708,7 @@ class TrayApp:
         save_state(state)
 
     def apply_config(self) -> None:
-        interval_ms = max(5, int(self.config.get("interval_seconds", 10))) * 1000
+        interval_ms = max(2, int(self.config.get("interval_seconds", 10))) * 1000
 
         if self.config.get("enabled", True):
             self.timer.start(interval_ms)
@@ -685,7 +730,6 @@ class TrayApp:
             return
 
         self.client.fetch_fields(base_url, token)
-        self.client.fetch_request_types(base_url, token)
         self._field_map_loaded = True
         self.logger.info("Карта полей Jira загружена")
 
@@ -723,7 +767,10 @@ class TrayApp:
 
         # Надежный fallback для Windows: поднимаем окно, даже если фокус украден другим приложением.
         if sys.platform.startswith("win"):
-            QGuiApplication.alert(window, 2000)
+            try:
+                QApplication.alert(window, 2000)
+            except AttributeError:
+                pass
 
     def show_dashboard(self) -> None:
         self._present_window(self.dashboard)
@@ -822,8 +869,6 @@ class TrayApp:
             except TypeError:
                 # fallback для старых сигнатур win11toast
                 win_toast(title, summary, **payload)
-            # Резервный канал через Qt-tray, чтобы не терять уведомления при ограничениях Win Toast.
-            self.show_qt_message(title, summary)
 
         except Exception as e:
             self.logger.error(f"Toast error: {e}")
@@ -840,6 +885,13 @@ class TrayApp:
         return sorted(issues, key=created_key, reverse=True)
 
     @staticmethod
+    def newest_first_jql(jql: str) -> str:
+        value = str(jql or "").strip()
+        if " order by " in value.lower():
+            return value
+        return f"{value} ORDER BY created DESC"
+
+    @staticmethod
     def sort_completed_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         def resolved_key(issue: dict[str, Any]) -> str:
             fields = issue.get("fields", {}) or {}
@@ -847,9 +899,11 @@ class TrayApp:
         return sorted(issues, key=resolved_key, reverse=True)
 
     def run_check(self, force_notify: bool = False) -> None:
-        if self._check_in_progress:
-            self.logger.info("Проверка пропущена: предыдущая ещё идёт")
-            return
+        with self._check_lock:
+            if self._check_in_progress:
+                self._check_again_requested = True
+                self.logger.debug("Previous Jira check is still running; scheduling one more")
+                return
 
         token = self.config.get("token", "").strip()
         base_url = self.config.get("base_url", "").strip()
@@ -866,16 +920,72 @@ class TrayApp:
             self.logger.info("Проверка пропущена: мониторинг выключен")
             return
 
-        self._check_in_progress = True
+        red_jql = self.newest_first_jql(red_jql)
+        blue_jql = self.newest_first_jql(blue_jql)
+        work_jql = self.newest_first_jql(work_jql)
+
+        with self._check_lock:
+            if self._check_in_progress:
+                self._check_again_requested = True
+                self.logger.debug("Previous Jira check is still running; scheduling one more")
+                return
+            self._check_in_progress = True
         self.logger.info("Запуск проверки Jira")
 
         def worker() -> None:
             try:
                 self.ensure_field_map_loaded()
 
-                red_issues = self.client.fetch_issues(base_url, token, red_jql)
-                blue_issues_raw = self.client.fetch_issues(base_url, token, blue_jql)
-                work_issues = self.client.fetch_issues(base_url, token, work_jql)
+                fields = self.client.monitoring_fields()
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    red_future = executor.submit(self.client.fetch_issues, base_url, token, red_jql, fields)
+                    blue_future = executor.submit(self.client.fetch_issues, base_url, token, blue_jql, fields)
+                    work_future = executor.submit(self.client.fetch_issues, base_url, token, work_jql, fields)
+                    red_issues = red_future.result()
+                    blue_issues_raw = blue_future.result()
+                    if not force_notify:
+                        early_red_keys_raw = {issue.get("key") for issue in red_issues if issue.get("key")}
+                        early_blue_issues = [
+                            issue
+                            for issue in blue_issues_raw
+                            if issue.get("key") and issue.get("key") not in early_red_keys_raw
+                        ]
+                        early_red_issues = self.sort_issues_newest_first(red_issues)
+                        early_blue_issues = self.sort_issues_newest_first(early_blue_issues)
+                        early_red_keys = {issue.get("key") for issue in early_red_issues if issue.get("key")}
+                        early_blue_keys = {issue.get("key") for issue in early_blue_issues if issue.get("key")}
+                        early_new_red = [issue for issue in early_red_issues if issue.get("key") not in self.known_red]
+                        early_new_blue = [issue for issue in early_blue_issues if issue.get("key") not in self.known_blue]
+
+                        if early_new_red or early_new_blue:
+                            self._track_daily_created_seen(early_new_red + early_new_blue)
+                            self.analytics["new_red_count"] = self._safe_int(self.analytics.get("new_red_count", 0)) + len(early_new_red)
+                            self.analytics["new_blue_count"] = self._safe_int(self.analytics.get("new_blue_count", 0)) + len(early_new_blue)
+                            self.current_red_keys = early_red_keys
+                            self.current_blue_keys = early_blue_keys
+                            self.current_red_issues = early_red_issues
+                            self.current_blue_issues = early_blue_issues
+                            self.last_check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            self.last_error = ""
+                            for issue in early_new_red:
+                                self.notify_issue(issue, is_red=True)
+                            for issue in early_new_blue:
+                                self.notify_issue(issue, is_red=False)
+                            self.known_red |= early_red_keys
+                            self.known_blue |= early_blue_keys
+                            for issue in early_new_red + early_new_blue:
+                                issue_key = str(issue.get("key") or "").strip()
+                                if not issue_key or issue_key in self.duplicate_hints_shown:
+                                    continue
+                                similar_key = self._find_similar_issue_key(issue)
+                                if similar_key:
+                                    self.notify_similar_issue(issue_key, similar_key)
+                                    self.duplicate_hints_shown.add(issue_key)
+                            self.signals.red_issues_updated.emit(self.current_red_issues)
+                            self.signals.blue_issues_updated.emit(self.current_blue_issues)
+                            self.signals.analytics_updated.emit(self.analytics)
+                            self.emit_stats()
+                    work_issues = work_future.result()
 
                 red_keys_raw = {issue.get("key") for issue in red_issues if issue.get("key")}
                 blue_issues = [
@@ -951,7 +1061,11 @@ class TrayApp:
                 self.logger.exception(f"Неожиданная ошибка: {e}")
                 self.show_qt_message(APP_TITLE, f"Ошибка: {e}")
             finally:
-                self._check_in_progress = False
+                run_again = False
+                with self._check_lock:
+                    self._check_in_progress = False
+                    run_again = self._check_again_requested
+                    self._check_again_requested = False
                 self.update_tray_tooltip()
                 self.persist_state()
                 self.emit_stats()
@@ -959,5 +1073,7 @@ class TrayApp:
                 self.signals.blue_issues_updated.emit(self.current_blue_issues)
                 self.signals.work_issues_updated.emit(self.current_work_issues)
                 self.signals.analytics_updated.emit(self.analytics)
+                if run_again:
+                    QTimer.singleShot(0, self.run_check)
 
         threading.Thread(target=worker, daemon=True).start()

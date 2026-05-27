@@ -1,18 +1,49 @@
+import threading
 from typing import Any
 import requests
 from requests import Session
+from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException
+
+REQUEST_TIMEOUT = (3.05, 10)
+MONITORING_BASE_FIELDS = {
+    "summary",
+    "status",
+    "assignee",
+    "reporter",
+    "creator",
+    "created",
+    "resolved",
+    "priority",
+    "issuetype",
+}
 
 
 class JiraClient:
     def __init__(self) -> None:
-        self.session: Session = requests.Session()
+        self._session_local = threading.local()
+        self.session: Session = self._make_session()
         self.field_name_map: dict[str, str] = {}
         self.region_field_ids: list[str] = []
         self.region_portal_field_ids: list[str] = []
         self.request_type_field_ids: list[str] = []
         self.request_type_name_map: dict[str, str] = {}
         self.issue_request_type_cache: dict[str, str] = {}
+
+    @staticmethod
+    def _make_session() -> Session:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
+    def _worker_session(self) -> Session:
+        session = getattr(self._session_local, "session", None)
+        if session is None:
+            session = self._make_session()
+            self._session_local.session = session
+        return session
 
     def _headers(self, token: str) -> dict[str, str]:
         return {
@@ -23,7 +54,7 @@ class JiraClient:
 
     def fetch_fields(self, base_url: str, token: str) -> None:
         url = f"{base_url.rstrip('/')}/rest/api/2/field"
-        response = self.session.get(url, headers=self._headers(token), timeout=20)
+        response = self.session.get(url, headers=self._headers(token), timeout=REQUEST_TIMEOUT)
 
         if not response.ok:
             raise RequestException(f"HTTP {response.status_code}: {response.text}")
@@ -50,6 +81,15 @@ class JiraClient:
             lowered = field_name.lower()
             if lowered == "регион":
                 self.region_field_ids.append(field_id)
+                continue
+            if lowered == "регион портал":
+                self.region_portal_field_ids.append(field_id)
+                continue
+            if lowered in {"тип запроса", "тип обращения"}:
+                self.request_type_field_ids.append(field_id)
+                continue
+            if lowered == "регион":
+                self.region_field_ids.append(field_id)
             elif lowered == "регион портал":
                 self.region_portal_field_ids.append(field_id)
             elif lowered in {"тип запроса", "тип обращения", "request type"}:
@@ -62,7 +102,7 @@ class JiraClient:
             return self.request_type_name_map[request_type_id]
 
         detail_url = f"{base_url.rstrip('/')}/rest/servicedeskapi/requesttype/{request_type_id}"
-        detail_response = self.session.get(detail_url, headers=self._headers(token), timeout=20)
+        detail_response = self.session.get(detail_url, headers=self._headers(token), timeout=REQUEST_TIMEOUT)
         if detail_response.ok:
             detail_payload = detail_response.json()
             payload = detail_payload if isinstance(detail_payload, dict) else {}
@@ -75,7 +115,7 @@ class JiraClient:
 
     def fetch_request_types(self, base_url: str, token: str) -> None:
         url = f"{base_url.rstrip('/')}/rest/servicedeskapi/requesttype"
-        response = self.session.get(url, headers=self._headers(token), timeout=20)
+        response = self.session.get(url, headers=self._headers(token), timeout=REQUEST_TIMEOUT)
         self.request_type_name_map.clear()
         if response.ok:
             data = response.json()
@@ -90,7 +130,7 @@ class JiraClient:
                         self.request_type_name_map[request_type_id] = request_type_name
 
         desks_url = f"{base_url.rstrip('/')}/rest/servicedeskapi/servicedesk"
-        desks_response = self.session.get(desks_url, headers=self._headers(token), timeout=20)
+        desks_response = self.session.get(desks_url, headers=self._headers(token), timeout=REQUEST_TIMEOUT)
         if not desks_response.ok:
             return
         desks_data = desks_response.json()
@@ -105,7 +145,7 @@ class JiraClient:
             if not desk_id:
                 continue
             desk_types_url = f"{base_url.rstrip('/')}/rest/servicedeskapi/servicedesk/{desk_id}/requesttype"
-            desk_types_response = self.session.get(desk_types_url, headers=self._headers(token), timeout=20)
+            desk_types_response = self.session.get(desk_types_url, headers=self._headers(token), timeout=REQUEST_TIMEOUT)
             if not desk_types_response.ok:
                 continue
             desk_types_data = desk_types_response.json()
@@ -120,11 +160,29 @@ class JiraClient:
                 if request_type_id and request_type_name:
                     self.request_type_name_map[request_type_id] = request_type_name
 
-    def fetch_issues(self, base_url: str, token: str, jql: str) -> list[dict[str, Any]]:
-        url = f"{base_url.rstrip('/')}/rest/api/2/search"
-        params = {"jql": jql, "maxResults": 100, "fields": "*all"}
+    def monitoring_fields(self) -> str:
+        fields = set(MONITORING_BASE_FIELDS)
+        fields.update(self.region_field_ids)
+        fields.update(self.region_portal_field_ids)
+        return ",".join(sorted(fields))
 
-        response = self.session.get(url, params=params, headers=self._headers(token), timeout=20)
+    def fetch_issues(
+        self,
+        base_url: str,
+        token: str,
+        jql: str,
+        fields: str | None = None,
+        max_results: int = 100,
+    ) -> list[dict[str, Any]]:
+        url = f"{base_url.rstrip('/')}/rest/api/2/search"
+        params = {"jql": jql, "maxResults": max_results, "fields": fields or "*all"}
+
+        response = self._worker_session().get(
+            url,
+            params=params,
+            headers=self._headers(token),
+            timeout=REQUEST_TIMEOUT,
+        )
         if not response.ok:
             raise RequestException(f"HTTP {response.status_code}: {response.text}")
 
@@ -140,6 +198,10 @@ class JiraClient:
 
         for key, value in fields.items():
             readable = self.field_name_map.get(key, key).strip().lower()
+            if readable in {"регион", "регион портал"}:
+                parsed = self._parse_region_value(value)
+                if parsed:
+                    return parsed
             if readable in {"регион", "регион портал"}:
                 parsed = self._parse_region_value(value)
                 if parsed:
@@ -163,7 +225,7 @@ class JiraClient:
             return cached
 
         url = f"{base_url.rstrip('/')}/rest/servicedeskapi/request/{issue_key}"
-        response = self.session.get(url, headers=self._headers(token), timeout=20)
+        response = self.session.get(url, headers=self._headers(token), timeout=REQUEST_TIMEOUT)
         if response.ok:
             response_data = response.json()
             data = response_data if isinstance(response_data, dict) else {}
