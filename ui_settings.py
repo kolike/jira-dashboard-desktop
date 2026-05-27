@@ -69,7 +69,7 @@ class SettingsWindow(QWidget):
         self.token_edit.setEchoMode(QLineEdit.Password)
 
         self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(5, 3600)
+        self.interval_spin.setRange(2, 3600)
 
         self.red_jql_edit = QTextEdit()
         self.blue_jql_edit = QTextEdit()
