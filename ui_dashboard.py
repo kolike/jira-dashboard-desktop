@@ -565,10 +565,15 @@ class DashboardWindow(QWidget):
             widget.setItemWidget(item, empty_card)
             return
 
-        for issue in issues:
+        sorted_issues = sorted(
+            issues,
+            key=lambda issue: 0 if "работ" in self.get_status_name(issue.get("fields", {}) or {}).lower() else 1,
+        )
+
+        for issue in sorted_issues:
             fields = issue.get("fields", {}) or {}
             issue_key = issue.get("key", "UNKNOWN")
-            summary = trim_text(fields.get("summary") or "Без темы", 44)
+            summary = trim_text(fields.get("summary") or "Без темы", 36)
             status_name = self.get_status_name(fields)
             region_name = self.tray_app.client.extract_region(fields)
             author_name = self.tray_app.client.extract_author(fields)
@@ -629,8 +634,8 @@ class DashboardWindow(QWidget):
         layout.setSpacing(4)
 
         for index, line in enumerate(text_lines):
-            label = QLabel(line)
-            label.setWordWrap(True)
+            label = QLabel(self.truncate_card_line(line, index))
+            label.setWordWrap(False)
 
             if index == 0:
                 label.setStyleSheet("color:#F8FAFC;font-size:14px;font-weight:900;")
@@ -674,6 +679,16 @@ class DashboardWindow(QWidget):
 
         frame.setLayout(layout)
         return frame
+
+    @staticmethod
+    def truncate_card_line(text: str, index: int) -> str:
+        if index == 0:
+            max_len = 16
+        elif index == 1:
+            max_len = 34
+        else:
+            max_len = 38
+        return trim_text(text, max_len)
 
     def work_issue_accent(self, fields):
         status = self.get_status_name(fields).lower()
